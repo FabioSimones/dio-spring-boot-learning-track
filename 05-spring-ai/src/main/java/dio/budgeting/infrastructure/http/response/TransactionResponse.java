@@ -3,6 +3,8 @@ package dio.budgeting.infrastructure.http.response;
 import dio.budgeting.application.output.TransactionOutput;
 import io.swagger.v3.oas.annotations.media.Schema;
 
+import java.math.BigDecimal;
+
 @Schema(description = "Transação financeira persistida, retornada pelo cadastro e pela consulta por categoria")
 public record TransactionResponse(
 
@@ -15,12 +17,8 @@ public record TransactionResponse(
         @Schema(description = "Descrição do gasto", example = "Combustível")
         String description,
 
-        @Schema(
-                description = "Valor da transação, formatado com duas casas decimais. Não há conversão de escala "
-                        + "aplicada sobre o valor de entrada (ver observação em TransactionRequest.amount).",
-                example = "80.0"
-        )
-        double amount) {
+        @Schema(description = "Valor da transação em reais, sempre com duas casas decimais", example = "80.90")
+        BigDecimal amount) {
     public static TransactionResponse from(TransactionOutput output) {
         return new TransactionResponse(output.id(), output.category(), output.description(), output.value());
     }

@@ -4,6 +4,8 @@ import dio.budgeting.application.input.PersistTransactionInput;
 import dio.budgeting.domain.Category;
 import io.swagger.v3.oas.annotations.media.Schema;
 
+import java.math.BigDecimal;
+
 @Schema(description = "Payload de cadastro de uma transação financeira via REST")
 public record TransactionRequest(
 
@@ -14,13 +16,11 @@ public record TransactionRequest(
         Category category,
 
         @Schema(
-                description = "Valor do gasto. O tipo é `long` e o código atual não aplica nenhuma conversão de "
-                        + "escala nem valida a unidade (reais ou centavos); a unidade real ainda não foi definida "
-                        + "de forma consistente no projeto e será padronizada em uma tarefa futura, sem alterar o "
-                        + "contrato atual deste campo.",
-                example = "80"
+                description = "Valor da transação em reais, com até duas casas decimais. O valor é normalizado "
+                        + "para duas casas decimais (RoundingMode.HALF_UP) ao ser persistido.",
+                example = "80.90"
         )
-        long amount) {
+        BigDecimal amount) {
     public PersistTransactionInput toInput() {
         return new PersistTransactionInput(description, amount, category);
     }

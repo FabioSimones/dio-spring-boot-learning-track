@@ -79,6 +79,19 @@ class SwaggerDocumentationTest {
     }
 
     @Test
+    void amountSchema_isDocumentedAsDecimalNumber_notInteger() throws Exception {
+        mockMvc.perform(get("/v3/api-docs"))
+                .andExpect(jsonPath("$.components.schemas.TransactionRequest.properties.amount.type").value("number"))
+                .andExpect(jsonPath("$.components.schemas.TransactionResponse.properties.amount.type").value("number"));
+    }
+
+    @Test
+    void postTransactionsExample_usesDecimalAmount() throws Exception {
+        mockMvc.perform(get("/v3/api-docs"))
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("80.9")));
+    }
+
+    @Test
     void getTransactionsByCategory_documentsCategoryPathParameter() throws Exception {
         mockMvc.perform(get("/v3/api-docs"))
                 .andExpect(jsonPath("$.paths./transactions/{category}.get.parameters[0].name").value("category"));

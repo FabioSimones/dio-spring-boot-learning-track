@@ -113,6 +113,13 @@ Exemplo de uso do Swagger UI:
 3. Expanda `GET /transactions/{category}` e selecione uma categoria no seletor do enum.
 4. Para `POST /transactions/ai`, o Swagger UI exibe um seletor de arquivo — evite enviar um áudio real a menos que você aceite o custo de uma chamada real à OpenAI.
 
+## Monetary Values
+
+- `amount` is represented as `BigDecimal`, in **reais**, always normalized to **two decimal places** (`RoundingMode.HALF_UP`), from the domain (`Transaction`) through persistence (`DECIMAL(19,2)`) and both REST/Tool Calling responses.
+- Example request: `{"description": "Combustível", "amount": 80.90, "category": "AUTO"}` → response: `{"id": "...", "category": "AUTO", "description": "Combustível", "amount": 80.90}`.
+- Values are rounded, not truncated, when they carry more than two decimal places (e.g. `80.905` becomes `80.91`); the Swagger schema documents `amount` as a decimal number.
+- **Local database note**: if a local MySQL instance was already running with the previous `BIGINT` column, the schema won't be auto-migrated safely by Hibernate (`ddl-auto=update` does not convert `BIGINT` to `DECIMAL`). Recreate the local dev database (or manually `ALTER TABLE`) before running against a pre-existing schema.
+
 ## Notes
 
 - Educational final project focused on AI plus architectural discipline.

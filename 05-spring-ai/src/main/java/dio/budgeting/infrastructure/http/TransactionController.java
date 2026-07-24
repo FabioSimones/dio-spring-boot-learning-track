@@ -71,7 +71,7 @@ public class TransactionController {
                                               "id": "3f1c9e2a-2b8b-4e0f-8b7a-1f2e3d4c5b6a",
                                               "category": "AUTO",
                                               "description": "Combustível",
-                                              "amount": 80.0
+                                              "amount": 80.90
                                             }"""
                             )
                     )
