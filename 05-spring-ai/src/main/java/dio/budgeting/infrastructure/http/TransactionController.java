@@ -3,6 +3,7 @@ package dio.budgeting.infrastructure.http;
 import dio.budgeting.application.ListTransactionsByCategoryUseCase;
 import dio.budgeting.application.PersistTransactionUseCase;
 import dio.budgeting.domain.Category;
+import dio.budgeting.infrastructure.http.audio.AudioFileValidator;
 import dio.budgeting.infrastructure.http.error.ApiErrorResponse;
 import dio.budgeting.infrastructure.http.request.TransactionRequest;
 import dio.budgeting.infrastructure.http.response.TransactionResponse;
@@ -39,13 +40,15 @@ public class TransactionController {
     private final TranscriptionModel transcriptionModel;
     private final ChatClient chatClient;
     private final TextToSpeechModel textToSpeechModel;
+    private final AudioFileValidator audioFileValidator;
 
     public TransactionController(PersistTransactionUseCase persistTransactionUseCase,
                                  ListTransactionsByCategoryUseCase listTransactionsByCategoryUseCase,
                                  TranscriptionModel transcriptionModel,
                                  @Value("classpath:prompts/system-message.st") Resource systemPrompt,
                                  ChatClient.Builder chatClientBuilder,
-                                 TextToSpeechModel textToSpeechModel) throws IOException {
+                                 TextToSpeechModel textToSpeechModel,
+                                 AudioFileValidator audioFileValidator) throws IOException {
         this.persistTransactionUseCase = persistTransactionUseCase;
         this.listTransactionsByCategoryUseCase = listTransactionsByCategoryUseCase;
         this.transcriptionModel = transcriptionModel;
@@ -54,6 +57,7 @@ public class TransactionController {
                 .defaultTools(persistTransactionUseCase, listTransactionsByCategoryUseCase)
                 .build();
         this.textToSpeechModel = textToSpeechModel;
+        this.audioFileValidator = audioFileValidator;
     }
 
     @Operation(
@@ -169,7 +173,10 @@ public class TransactionController {
 
                     Requer a variável de ambiente OPENAI_API_KEY configurada no servidor. Cada chamada a este \
                     endpoint realiza 3 chamadas reais e potencialmente pagas à API da OpenAI (transcrição, chat e \
-                    geração de voz)."""
+                    geração de voz).
+
+                    O arquivo é validado localmente (tamanho máximo de 10 MB e content type entre os aceitos) antes \
+                    de qualquer chamada à OpenAI: um arquivo inválido nunca gera custo."""
     )
     @ApiResponses({
             @ApiResponse(
@@ -179,17 +186,37 @@ public class TransactionController {
             ),
             @ApiResponse(
                     responseCode = "400",
-                    description = "Requisição multipart inválida: parte 'file' ausente ou requisição não multipart.",
+                    description = "Parte 'file' ausente, requisição não multipart, arquivo vazio ou content type "
+                            + "não permitido.",
                     content = @Content(
                             schema = @Schema(implementation = ApiErrorResponse.class),
                             examples = @ExampleObject(
-                                    name = "Arquivo obrigatório",
+                                    name = "Arquivo de áudio inválido",
                                     value = """
                                             {
                                               "type": "about:blank",
-                                              "title": "Arquivo obrigatório",
+                                              "title": "Arquivo de áudio inválido",
                                               "status": 400,
-                                              "detail": "O arquivo de áudio é obrigatório.",
+                                              "detail": "O tipo do arquivo de áudio não é permitido.",
+                                              "instance": "/transactions/ai",
+                                              "timestamp": "2026-07-24T18:00:00-03:00"
+                                            }"""
+                            )
+                    )
+            ),
+            @ApiResponse(
+                    responseCode = "413",
+                    description = "Arquivo acima do tamanho máximo permitido (10 MB).",
+                    content = @Content(
+                            schema = @Schema(implementation = ApiErrorResponse.class),
+                            examples = @ExampleObject(
+                                    name = "Arquivo muito grande",
+                                    value = """
+                                            {
+                                              "type": "about:blank",
+                                              "title": "Arquivo muito grande",
+                                              "status": 413,
+                                              "detail": "O arquivo enviado excede o tamanho máximo permitido.",
                                               "instance": "/transactions/ai",
                                               "timestamp": "2026-07-24T18:00:00-03:00"
                                             }"""
@@ -205,14 +232,17 @@ public class TransactionController {
     @PostMapping(value = "/ai", consumes = MediaType.MULTIPART_FORM_DATA_VALUE, produces = "audio/mp3")
     ResponseEntity<Resource> transcribe(
             @Parameter(
-                    description = "Arquivo de áudio com o comando financeiro falado. O código não valida content-type "
-                            + "nem formato: nenhum formato é tecnicamente imposto pela implementação atual. Os "
-                            + "arquivos de teste do projeto usam .m4a; outros formatos aceitos pelo modelo whisper-1 "
-                            + "da OpenAI são apenas recomendação para testes manuais, não uma garantia validada em código.",
+                    description = "Arquivo de áudio com o comando financeiro falado. Obrigatório, até 10 MB, "
+                            + "content type entre: audio/mpeg, audio/mp3, audio/mp4, audio/m4a, audio/x-m4a, "
+                            + "audio/wav, audio/x-wav, audio/webm. Validado localmente antes de qualquer chamada à "
+                            + "OpenAI. Os arquivos de teste do projeto usam .m4a; a validação é feita pelo header "
+                            + "content type declarado pelo cliente, não pela inspeção do conteúdo binário.",
                     required = true,
                     content = @Content(mediaType = MediaType.MULTIPART_FORM_DATA_VALUE)
             )
             @RequestParam("file") MultipartFile file) {
+        audioFileValidator.validate(file);
+
         var userMessage = transcriptionModel.transcribe(file.getResource());
         var result = chatClient.prompt().user(userMessage).call().content();
 

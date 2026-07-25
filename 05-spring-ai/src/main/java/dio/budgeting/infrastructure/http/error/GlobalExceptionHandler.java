@@ -3,6 +3,7 @@ package dio.budgeting.infrastructure.http.error;
 import tools.jackson.databind.exc.InvalidFormatException;
 import dio.budgeting.domain.Category;
 import dio.budgeting.domain.InvalidTransactionException;
+import dio.budgeting.infrastructure.http.audio.InvalidAudioFileException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -13,6 +14,7 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.MultipartException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
 
@@ -76,10 +78,31 @@ public class GlobalExceptionHandler {
         return problemDetail(HttpStatus.BAD_REQUEST, "Parâmetro inválido", detail, request);
     }
 
-    @ExceptionHandler({MissingServletRequestPartException.class, MultipartException.class})
-    public ProblemDetail handleMissingFile(Exception ex, HttpServletRequest request) {
+    @ExceptionHandler(MissingServletRequestPartException.class)
+    public ProblemDetail handleMissingPart(MissingServletRequestPartException ex, HttpServletRequest request) {
         return problemDetail(HttpStatus.BAD_REQUEST, "Arquivo obrigatório",
                 "O arquivo de áudio é obrigatório.", request);
+    }
+
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    public ProblemDetail handleMaxUploadSizeExceeded(MaxUploadSizeExceededException ex, HttpServletRequest request) {
+        return problemDetail(HttpStatus.CONTENT_TOO_LARGE, "Arquivo muito grande",
+                "O arquivo enviado excede o tamanho máximo permitido.", request);
+    }
+
+    @ExceptionHandler(MultipartException.class)
+    public ProblemDetail handleMultipartException(MultipartException ex, HttpServletRequest request) {
+        return problemDetail(HttpStatus.BAD_REQUEST, "Requisição inválida",
+                "A requisição multipart está ausente ou possui formato inválido.", request);
+    }
+
+    @ExceptionHandler(InvalidAudioFileException.class)
+    public ProblemDetail handleInvalidAudioFile(InvalidAudioFileException ex, HttpServletRequest request) {
+        var status = ex.getReason() == InvalidAudioFileException.Reason.TOO_LARGE
+                ? HttpStatus.CONTENT_TOO_LARGE
+                : HttpStatus.BAD_REQUEST;
+        var title = status == HttpStatus.CONTENT_TOO_LARGE ? "Arquivo muito grande" : "Arquivo de áudio inválido";
+        return problemDetail(status, title, ex.getMessage(), request);
     }
 
     @ExceptionHandler(Exception.class)

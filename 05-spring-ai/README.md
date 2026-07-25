@@ -113,6 +113,39 @@ Exemplo de uso do Swagger UI:
 3. Expanda `GET /transactions/{category}` e selecione uma categoria no seletor do enum.
 4. Para `POST /transactions/ai`, o Swagger UI exibe um seletor de arquivo — evite enviar um áudio real a menos que você aceite o custo de uma chamada real à OpenAI.
 
+## Upload de áudio
+
+`POST /transactions/ai` recebe o comando de voz como `multipart/form-data`, na parte obrigatória `file`.
+
+Antes de qualquer chamada à OpenAI (transcrição, ChatClient, geração de voz), o arquivo é validado localmente por `AudioFileValidator` (`dio.budgeting.infrastructure.http.audio`):
+
+1. arquivo presente e não vazio;
+2. tamanho dentro do limite (`app.audio.max-size`, padrão **10 MB**);
+3. `content type` presente;
+4. `content type` entre os aceitos: `audio/mpeg`, `audio/mp3`, `audio/mp4`, `audio/m4a`, `audio/x-m4a`, `audio/wav`, `audio/x-wav`, `audio/webm`.
+
+Um arquivo que falhe em qualquer uma dessas regras é rejeitado **sem gerar custo**: nenhuma chamada a `TranscriptionModel`, `ChatClient` ou `TextToSpeechModel` ocorre para um upload inválido.
+
+Exemplo de requisição válida (adaptar caminho do arquivo):
+
+```bash
+curl -X POST \
+  http://localhost:8080/transactions/ai \
+  -H "Content-Type: multipart/form-data" \
+  -F "file=@comando.mp3;type=audio/mpeg"
+```
+
+**Erros possíveis**:
+
+| Situação | Status | Título |
+| -------- | -----: | ------ |
+| Arquivo vazio, sem `content type` ou tipo não permitido | 400 | Arquivo de áudio inválido |
+| Parte `file` ausente | 400 | Arquivo obrigatório |
+| Requisição não multipart / multipart malformado | 400 | Requisição inválida |
+| Arquivo acima de 10 MB (validado localmente ou rejeitado pelo servidor) | 413 | Arquivo muito grande |
+
+**Atenção**: esta validação verifica apenas o `content type` declarado pelo cliente, não o conteúdo binário do arquivo — um arquivo renomeado (ex.: `.exe` enviado como `audio/mpeg`) não é detectado. Uploads que passam na validação ainda geram chamadas reais e potencialmente pagas à API da OpenAI.
+
 ## Monetary Values
 
 - `amount` is represented as `BigDecimal`, in **reais**, always normalized to **two decimal places** (`RoundingMode.HALF_UP`), from the domain (`Transaction`) through persistence (`DECIMAL(19,2)`) and both REST/Tool Calling responses.
@@ -174,9 +207,13 @@ Todos os endpoints REST retornam erros em um contrato único e previsível, base
 
 - JSON malformado ou tipos incompatíveis (ex.: `amount` como texto) retornam `400` com título `Requisição inválida` e uma mensagem genérica e segura — sem nomes de classes internas, caminhos ou detalhes do Jackson.
 
-### Arquivo ausente (`POST /transactions/ai`)
+### Upload de áudio (`POST /transactions/ai`)
 
-- Requisição sem a parte `file` (ou não multipart) retorna `400` com título `Arquivo obrigatório` e detalhe `"O arquivo de áudio é obrigatório."`, sem acionar transcrição, ChatClient ou geração de voz.
+- Parte `file` ausente retorna `400` com título `Arquivo obrigatório`.
+- Requisição não multipart ou malformada retorna `400` com título `Requisição inválida`.
+- Arquivo vazio, sem `content type` ou com tipo não permitido retorna `400` com título `Arquivo de áudio inválido` (ver [seção de upload de áudio](#upload-de-áudio) para a lista completa de regras).
+- Arquivo acima do tamanho máximo (validado localmente ou rejeitado pelo servidor via `MaxUploadSizeExceededException`) retorna `413` com título `Arquivo muito grande`.
+- Em todos os casos acima, nenhuma chamada a transcrição, ChatClient ou geração de voz ocorre.
 
 ### Erro interno
 

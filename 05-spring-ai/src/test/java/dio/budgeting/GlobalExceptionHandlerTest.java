@@ -4,6 +4,8 @@ import dio.budgeting.application.PersistTransactionUseCase;
 import dio.budgeting.application.ListTransactionsByCategoryUseCase;
 import dio.budgeting.domain.InvalidTransactionException;
 import dio.budgeting.domain.TransactionRepository;
+import dio.budgeting.infrastructure.http.audio.InvalidAudioFileException;
+import dio.budgeting.infrastructure.http.error.GlobalExceptionHandler;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.audio.transcription.TranscriptionModel;
 import org.springframework.ai.audio.tts.TextToSpeechModel;
@@ -11,9 +13,15 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.http.MediaType;
+import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
+import org.springframework.web.multipart.MultipartException;
 
+import java.net.URI;
+
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -232,5 +240,80 @@ class GlobalExceptionHandlerTest {
         org.assertj.core.api.Assertions.assertThat(body)
                 .doesNotContain("detalhe interno sensível")
                 .doesNotContain("RuntimeException");
+    }
+
+    // --- Audio upload validation (handler mapping, unit-level: no MockMvc/context needed) ---
+
+    @Test
+    void invalidAudioFileException_emptyReason_returns400() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleInvalidAudioFile(
+                new InvalidAudioFileException(InvalidAudioFileException.Reason.EMPTY,
+                        "O arquivo de áudio não pode estar vazio."),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(400);
+        assertThat(problem.getTitle()).isEqualTo("Arquivo de áudio inválido");
+        assertThat(problem.getDetail()).isEqualTo("O arquivo de áudio não pode estar vazio.");
+        assertThat(problem.getInstance()).isEqualTo(URI.create("/transactions/ai"));
+        assertThat(problem.getProperties()).containsKey("timestamp");
+    }
+
+    @Test
+    void invalidAudioFileException_unsupportedTypeReason_returns400() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleInvalidAudioFile(
+                new InvalidAudioFileException(InvalidAudioFileException.Reason.UNSUPPORTED_TYPE,
+                        "O tipo do arquivo de áudio não é permitido."),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(400);
+        assertThat(problem.getTitle()).isEqualTo("Arquivo de áudio inválido");
+        assertThat(problem.getDetail()).isEqualTo("O tipo do arquivo de áudio não é permitido.");
+    }
+
+    @Test
+    void invalidAudioFileException_tooLargeReason_returns413() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleInvalidAudioFile(
+                new InvalidAudioFileException(InvalidAudioFileException.Reason.TOO_LARGE,
+                        "O arquivo de áudio excede o tamanho máximo permitido."),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(413);
+        assertThat(problem.getTitle()).isEqualTo("Arquivo muito grande");
+        assertThat(problem.getDetail()).isEqualTo("O arquivo de áudio excede o tamanho máximo permitido.");
+    }
+
+    @Test
+    void maxUploadSizeExceededException_returns413_withGenericMessage() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleMaxUploadSizeExceeded(new MaxUploadSizeExceededException(10_485_760), request);
+
+        assertThat(problem.getStatus()).isEqualTo(413);
+        assertThat(problem.getTitle()).isEqualTo("Arquivo muito grande");
+        assertThat(problem.getDetail()).isEqualTo("O arquivo enviado excede o tamanho máximo permitido.");
+        assertThat(problem.getInstance()).isEqualTo(URI.create("/transactions/ai"));
+        assertThat(problem.getProperties()).containsKey("timestamp");
+    }
+
+    @Test
+    void malformedMultipartRequest_returns400_withGenericMessage() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleMultipartException(new MultipartException("boom"), request);
+
+        assertThat(problem.getStatus()).isEqualTo(400);
+        assertThat(problem.getTitle()).isEqualTo("Requisição inválida");
+        assertThat(problem.getDetail()).isEqualTo("A requisição multipart está ausente ou possui formato inválido.");
     }
 }

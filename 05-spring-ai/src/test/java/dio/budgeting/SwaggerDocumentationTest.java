@@ -115,4 +115,46 @@ class SwaggerDocumentationTest {
         mockMvc.perform(get("/swagger-ui/index.html"))
                 .andExpect(status().isOk());
     }
+
+    @Test
+    void aiEndpoint_filePart_isMarkedRequired() throws Exception {
+        mockMvc.perform(get("/v3/api-docs"))
+                .andExpect(jsonPath(
+                        "$.paths./transactions/ai.post.requestBody.content.['multipart/form-data'].schema.required")
+                        .value(org.hamcrest.Matchers.hasItem("file")));
+    }
+
+    @Test
+    void aiEndpoint_describesAcceptedFormatsAndSizeLimit() throws Exception {
+        mockMvc.perform(get("/v3/api-docs"))
+                .andExpect(jsonPath(
+                        "$.paths./transactions/ai.post.requestBody.content.['multipart/form-data'].schema.properties.file.description")
+                        .value(org.hamcrest.Matchers.allOf(
+                                org.hamcrest.Matchers.containsString("audio/mpeg"),
+                                org.hamcrest.Matchers.containsString("10 MB"))));
+    }
+
+    @Test
+    void aiEndpoint_documentsBadRequestResponse() throws Exception {
+        mockMvc.perform(get("/v3/api-docs"))
+                .andExpect(jsonPath("$.paths./transactions/ai.post.responses.400").exists());
+    }
+
+    @Test
+    void aiEndpoint_documentsPayloadTooLargeResponse() throws Exception {
+        mockMvc.perform(get("/v3/api-docs"))
+                .andExpect(jsonPath("$.paths./transactions/ai.post.responses.413").exists());
+    }
+
+    @Test
+    void aiEndpoint_documentsInternalServerErrorResponse() throws Exception {
+        mockMvc.perform(get("/v3/api-docs"))
+                .andExpect(jsonPath("$.paths./transactions/ai.post.responses.500").exists());
+    }
+
+    @Test
+    void aiEndpoint_successResponse_isStillAudioMp3() throws Exception {
+        mockMvc.perform(get("/v3/api-docs"))
+                .andExpect(jsonPath("$.paths./transactions/ai.post.responses.200.content.['audio/mp3']").exists());
+    }
 }
