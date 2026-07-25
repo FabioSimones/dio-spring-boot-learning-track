@@ -5,7 +5,7 @@ import org.springframework.ai.tool.annotation.ToolParam;
 
 import java.math.BigDecimal;
 
-public record PersistTransactionInput(@ToolParam(description = "Descrição do gasto") String description,
-                                      @ToolParam(description = "Valor da transação em reais, por exemplo 80.90") BigDecimal amount,
-                                      @ToolParam(description = "Categoria de uma transação") Category category) {
+public record PersistTransactionInput(@ToolParam(description = "Descrição do gasto (obrigatória, não pode ser vazia)") String description,
+                                      @ToolParam(description = "Valor da transação em reais, por exemplo 80.90. Deve ser maior que zero") BigDecimal amount,
+                                      @ToolParam(description = "Categoria de uma transação (obrigatória)") Category category) {
 }

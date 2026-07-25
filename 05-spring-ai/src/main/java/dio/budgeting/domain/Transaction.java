@@ -17,9 +17,26 @@ public class Transaction {
     }
 
     public Transaction(TransactionId id, String description, BigDecimal amount, Category category) {
+        if (amount == null) {
+            throw new InvalidTransactionException("O valor da transação é obrigatório.");
+        }
+        var normalizedAmount = normalize(amount);
+        if (normalizedAmount.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new InvalidTransactionException("O valor da transação deve ser maior que zero.");
+        }
+
+        if (description == null || description.isBlank()) {
+            throw new InvalidTransactionException("A descrição da transação não pode estar vazia.");
+        }
+        var normalizedDescription = description.strip();
+
+        if (category == null) {
+            throw new InvalidTransactionException("A categoria da transação é obrigatória.");
+        }
+
         this.id = id;
-        this.description = description;
-        this.amount = normalize(amount);
+        this.description = normalizedDescription;
+        this.amount = normalizedAmount;
         this.category = category;
     }
 

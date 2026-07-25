@@ -79,6 +79,19 @@ class SwaggerDocumentationTest {
     }
 
     @Test
+    void postTransactions_documentsBadRequestResponse() throws Exception {
+        mockMvc.perform(get("/v3/api-docs"))
+                .andExpect(jsonPath("$.paths./transactions.post.responses.400").exists());
+    }
+
+    @Test
+    void transactionRequestSchema_marksDescriptionCategoryAndAmount_asRequired() throws Exception {
+        mockMvc.perform(get("/v3/api-docs"))
+                .andExpect(jsonPath("$.components.schemas.TransactionRequest.required")
+                        .value(org.hamcrest.Matchers.containsInAnyOrder("description", "category", "amount")));
+    }
+
+    @Test
     void amountSchema_isDocumentedAsDecimalNumber_notInteger() throws Exception {
         mockMvc.perform(get("/v3/api-docs"))
                 .andExpect(jsonPath("$.components.schemas.TransactionRequest.properties.amount.type").value("number"))

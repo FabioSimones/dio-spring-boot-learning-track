@@ -13,6 +13,7 @@ import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.validation.Valid;
 import org.springframework.ai.audio.transcription.TranscriptionModel;
 import org.springframework.ai.audio.tts.TextToSpeechModel;
 import org.springframework.ai.chat.client.ChatClient;
@@ -75,11 +76,16 @@ public class TransactionController {
                                             }"""
                             )
                     )
+            ),
+            @ApiResponse(
+                    responseCode = "400",
+                    description = "Payload inválido (descrição vazia, valor nulo/zero/negativo ou categoria nula). "
+                            + "Sem corpo de erro padronizado nesta etapa do projeto."
             )
     })
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
-    public TransactionResponse createTransaction(@RequestBody TransactionRequest request) {
+    public TransactionResponse createTransaction(@Valid @RequestBody TransactionRequest request) {
         var transaction = persistTransactionUseCase.execute(request.toInput());
         return TransactionResponse.from(transaction);
     }

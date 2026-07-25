@@ -120,6 +120,29 @@ Exemplo de uso do Swagger UI:
 - Values are rounded, not truncated, when they carry more than two decimal places (e.g. `80.905` becomes `80.91`); the Swagger schema documents `amount` as a decimal number.
 - **Local database note**: if a local MySQL instance was already running with the previous `BIGINT` column, the schema won't be auto-migrated safely by Hibernate (`ddl-auto=update` does not convert `BIGINT` to `DECIMAL`). Recreate the local dev database (or manually `ALTER TABLE`) before running against a pre-existing schema.
 
+## Validations
+
+Business invariants are enforced centrally in the domain (`Transaction`), so both REST and Tool Calling go through the same protection — the rules do not depend on controller/DTO annotations alone:
+
+- **Description**: required, cannot be null/empty/blank; leading and trailing spaces are stripped (`"  Combustível  "` is stored as `"Combustível"`).
+- **Amount**: required, must be greater than zero **after** normalization to two decimals (`HALF_UP`) — e.g. `0.004` rounds to `0.00` and is rejected, while `0.005` rounds to `0.01` and is accepted.
+- **Category**: required, restricted to the current enum values (`GROCERIES`, `PHARMA`, `AUTO`).
+
+Invalid input throws `InvalidTransactionException` (a domain exception, no HTTP concept involved) before any repository call. Bean Validation annotations (`@NotBlank`, `@NotNull`, `@DecimalMin`) were added to `TransactionRequest` as a first HTTP-level barrier, causing `POST /transactions` to reject invalid payloads with `400 Bad Request` — but this is a convenience layer, not the source of truth.
+
+Valid request example:
+```json
+{"description": "Combustível", "amount": 80.90, "category": "AUTO"}
+```
+Invalid request examples (all rejected):
+```json
+{"description": "", "amount": 80.90, "category": "AUTO"}
+{"description": "Combustível", "amount": 0.00, "category": "AUTO"}
+{"description": "Combustível", "amount": -10.00, "category": "AUTO"}
+```
+
+There is **no standardized error response body yet** (no `@ControllerAdvice`) — invalid requests currently get Spring's default `400` error page/body. A structured, consistent error format is planned as a later evolution.
+
 ## Notes
 
 - Educational final project focused on AI plus architectural discipline.
