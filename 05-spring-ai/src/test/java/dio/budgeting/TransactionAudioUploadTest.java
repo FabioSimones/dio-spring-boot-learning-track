@@ -79,8 +79,10 @@ class TransactionAudioUploadTest {
         doNothing().when(audioFileValidator).validate(any());
         when(transcriptionModel.transcribe(any())).thenThrow(new RuntimeException("simulated transcription failure"));
 
+        // 502, not 500: AiTransactionProcessor (TASK-008) classifies unrecognized
+        // transcription failures as a generic AI integration failure, not an internal bug.
         mockMvc.perform(multipart("/transactions/ai").file(audioFile()))
-                .andExpect(status().isInternalServerError());
+                .andExpect(status().isBadGateway());
 
         verify(audioFileValidator).validate(any());
         verify(transcriptionModel).transcribe(any());

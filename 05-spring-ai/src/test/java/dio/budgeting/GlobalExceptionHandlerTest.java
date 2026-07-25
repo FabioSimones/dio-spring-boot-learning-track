@@ -316,4 +316,117 @@ class GlobalExceptionHandlerTest {
         assertThat(problem.getTitle()).isEqualTo("Requisição inválida");
         assertThat(problem.getDetail()).isEqualTo("A requisição multipart está ausente ou possui formato inválido.");
     }
+
+    // --- AI integration failures (TASK-008, handler mapping: no MockMvc/context needed) ---
+
+    @Test
+    void aiIntegrationException_transcriptionEmpty_returns422() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleAiIntegrationFailure(new dio.budgeting.infrastructure.ai.AiIntegrationException(
+                        dio.budgeting.infrastructure.ai.AiIntegrationException.Stage.TRANSCRIPTION,
+                        dio.budgeting.infrastructure.ai.AiIntegrationException.Reason.TRANSCRIPTION_EMPTY,
+                        "Não foi possível identificar conteúdo falado no áudio."),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(422);
+        assertThat(problem.getTitle()).isEqualTo("Áudio não processável");
+        assertThat(problem.getDetail()).isEqualTo("Não foi possível identificar conteúdo falado no áudio.");
+        assertThat(problem.getInstance()).isEqualTo(URI.create("/transactions/ai"));
+        assertThat(problem.getProperties()).containsKey("timestamp");
+    }
+
+    @Test
+    void aiIntegrationException_timeout_returns504() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleAiIntegrationFailure(new dio.budgeting.infrastructure.ai.AiIntegrationException(
+                        dio.budgeting.infrastructure.ai.AiIntegrationException.Stage.CHAT,
+                        dio.budgeting.infrastructure.ai.AiIntegrationException.Reason.TIMEOUT,
+                        "O serviço de inteligência artificial demorou mais que o esperado para responder."),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(504);
+        assertThat(problem.getTitle()).isEqualTo("Tempo limite excedido");
+    }
+
+    @Test
+    void aiIntegrationException_rateLimited_returns503_notRaw429() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleAiIntegrationFailure(new dio.budgeting.infrastructure.ai.AiIntegrationException(
+                        dio.budgeting.infrastructure.ai.AiIntegrationException.Stage.TRANSCRIPTION,
+                        dio.budgeting.infrastructure.ai.AiIntegrationException.Reason.RATE_LIMITED,
+                        "O serviço de inteligência artificial está temporariamente indisponível. Tente novamente mais tarde."),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(503);
+        assertThat(problem.getTitle()).isEqualTo("Serviço de IA temporariamente indisponível");
+    }
+
+    @Test
+    void aiIntegrationException_providerUnavailable_returns503() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleAiIntegrationFailure(new dio.budgeting.infrastructure.ai.AiIntegrationException(
+                        dio.budgeting.infrastructure.ai.AiIntegrationException.Stage.SPEECH,
+                        dio.budgeting.infrastructure.ai.AiIntegrationException.Reason.PROVIDER_UNAVAILABLE,
+                        "O serviço de inteligência artificial está temporariamente indisponível. Tente novamente mais tarde."),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(503);
+        assertThat(problem.getTitle()).isEqualTo("Serviço de IA temporariamente indisponível");
+    }
+
+    @Test
+    void aiIntegrationException_invalidProviderResponse_returns502() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleAiIntegrationFailure(new dio.budgeting.infrastructure.ai.AiIntegrationException(
+                        dio.budgeting.infrastructure.ai.AiIntegrationException.Stage.SPEECH,
+                        dio.budgeting.infrastructure.ai.AiIntegrationException.Reason.INVALID_PROVIDER_RESPONSE,
+                        "Não foi possível gerar a resposta em áudio."),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(502);
+        assertThat(problem.getTitle()).isEqualTo("Resposta inválida do serviço de IA");
+    }
+
+    @Test
+    void aiIntegrationException_genericFailure_returns502() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleAiIntegrationFailure(new dio.budgeting.infrastructure.ai.AiIntegrationException(
+                        dio.budgeting.infrastructure.ai.AiIntegrationException.Stage.TRANSCRIPTION,
+                        dio.budgeting.infrastructure.ai.AiIntegrationException.Reason.GENERIC_FAILURE,
+                        "Falha na integração com o serviço de inteligência artificial."),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(502);
+        assertThat(problem.getTitle()).isEqualTo("Falha na integração com IA");
+    }
+
+    @Test
+    void aiIntegrationException_configurationError_returns500_withoutLeakingCredentialDetails() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleAiIntegrationFailure(new dio.budgeting.infrastructure.ai.AiIntegrationException(
+                        dio.budgeting.infrastructure.ai.AiIntegrationException.Stage.TRANSCRIPTION,
+                        dio.budgeting.infrastructure.ai.AiIntegrationException.Reason.CONFIGURATION_ERROR,
+                        "O serviço de inteligência artificial não está disponível no momento.",
+                        new RuntimeException("Invalid API key provided: sk-test-sensitive")),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(500);
+        assertThat(problem.getTitle()).isEqualTo("Erro interno");
+        assertThat(problem.getDetail()).isEqualTo("O serviço de inteligência artificial não está disponível no momento.");
+        assertThat(problem.getDetail()).doesNotContain("sk-test-sensitive", "API key", "RuntimeException");
+    }
 }

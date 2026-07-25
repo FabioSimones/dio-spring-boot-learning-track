@@ -219,6 +219,32 @@ Todos os endpoints REST retornam erros em um contrato único e previsível, base
 
 - Falhas inesperadas retornam `500` com título `Erro interno` e mensagem genérica; o erro completo é registrado no servidor via SLF4J, nunca exposto ao cliente. Stack traces e mensagens técnicas nunca aparecem no corpo da resposta.
 
+## Falhas da integração com IA
+
+`POST /transactions/ai` encadeia três chamadas externas — transcrição, `ChatClient` (com Tool Calling) e geração de voz — cada uma classificada e traduzida para um `ProblemDetail` padronizado pelo `GlobalExceptionHandler`, via `AiIntegrationException` lançada pelo `AiTransactionProcessor` (`dio.budgeting.infrastructure.ai`).
+
+| Etapa | Motivo | Status | Título |
+| --- | --- | -----: | --- |
+| Transcrição | áudio sem fala identificável (texto nulo/vazio) | 422 | Áudio não processável |
+| Qualquer etapa | timeout de conexão/leitura | 504 | Tempo limite excedido |
+| Qualquer etapa | limite de requisições do provedor (HTTP 429) | 503 | Serviço de IA temporariamente indisponível |
+| Qualquer etapa | provedor indisponível (HTTP 5xx, conexão recusada) | 503 | Serviço de IA temporariamente indisponível |
+| Chat / TTS | resposta vazia ou estruturalmente inválida do provedor | 502 | Resposta inválida do serviço de IA |
+| Qualquer etapa | falha externa não classificada | 502 | Falha na integração com IA |
+| Qualquer etapa | credencial/configuração inválida (HTTP 401/403) | 500 | Erro interno |
+
+Um HTTP 429 do provedor **nunca** vira `429` na resposta desta API — o limite é da conta/organização OpenAI, não da API local; é tratado como `503` com uma mensagem que sugere tentar novamente mais tarde.
+
+**Timeout**: `spring.http.clients.connect-timeout` (10s) / `spring.http.clients.read-timeout` (60s) em `application.properties`. É uma configuração **global única**, compartilhada pelos três modelos (`ChatModel`, `TranscriptionModel`, `TextToSpeechModel`) — o Spring AI injeta o mesmo `RestClient.Builder`/`HttpClientSettings` nos três, não havendo suporte nativo a um timeout diferente por modelo sem reescrever manualmente cada bean (fora de escopo desta tarefa).
+
+**Retry**: o Spring AI já retenta automaticamente (`spring-ai-retry`/`SpringAiRetryAutoConfiguration`) falhas transitórias (HTTP 5xx, timeout/conexão) via um `RetryTemplate` **compartilhado** pelos três modelos — inclusive o `ChatClient`. Isso não duplica Tool Calling: o retry atua apenas na chamada HTTP individual; a execução do `@Tool` (`persist-transaction`) é um método Java local, disparado uma única vez por `tool_call`, fora do laço de retry (verificado em `DefaultToolCallingManager`/`MethodToolCallback`). As tentativas foram reduzidas do default (10, backoff até 3 min — inviável para um endpoint síncrono) para `spring.ai.retry.max-attempts=2` (1 tentativa adicional) com backoff curto (`spring.ai.retry.backoff.*`). HTTP 4xx (401, 429 etc.) nunca é retentado automaticamente.
+
+**Tool Calling e domínio**: com a configuração padrão do Spring AI (`DefaultToolExecutionExceptionProcessor`, `alwaysThrow=false`), uma exceção de domínio lançada pelas tools (`InvalidTransactionException`) é convertida em texto e devolvida ao modelo como resultado da tool — nunca propaga como exceção Java através do `ChatClient`. Um comando de voz inválido (ex.: valor zero) vira uma resposta em áudio explicando o problema, não um erro de integração de IA.
+
+**Risco conhecido de duplicação**: se o Tool Calling já persistiu a transação e a geração de voz falhar **depois**, a API retorna um erro padronizado (502/503/504) mesmo com a transação já salva. Um cliente que reenvie o comando de voz após esse erro pode gerar uma transação duplicada. Esta tarefa não implementa idempotência — fica registrada como limitação para uma tarefa futura.
+
+**Testes**: `AiTransactionProcessorTest` (unitário, mocks de `TranscriptionModel`/`ChatClient`/`TextToSpeechModel`, sem chamada real) e `OpenAiFailureHandlingTest` (MockMvc, `AiTransactionProcessor` mockado como caixa-preta) cobrem toda a classificação acima. Nenhum teste usa API key real ou chama a OpenAI.
+
 ## Testes automatizados
 
 O projeto combina três níveis de teste, cada um cobrindo uma responsabilidade diferente:
@@ -226,6 +252,7 @@ O projeto combina três níveis de teste, cada um cobrindo uma responsabilidade 
 - **Testes unitários** (`TransactionValidationTest`, `PersistTransactionUseCaseTest`, `MonetaryAmountBigDecimalTest`, `AudioFileValidatorTest`, `GlobalExceptionHandlerTest`) — validam regras de domínio, casos de uso e o handler de erros isoladamente, com mocks, sem subir o contexto Spring inteiro (ou subindo-o com `TransactionRepository`/beans de IA mockados).
 - **Testes HTTP com contrato mockado** (`TransactionControllerValidationTest`, `TransactionAudioUploadTest`, `SwaggerDocumentationTest`) — usam `MockMvc` contra o `TransactionController` real, mas com `TransactionRepository` mockado (`@MockitoBean`) e a autoconfiguração de JPA/DataSource excluída; comprovam o contrato HTTP (validação, status, `ProblemDetail`, documentação OpenAPI) sem tocar em persistência.
 - **Testes de integração REST** (`TransactionRestIntegrationTest`) — percorrem o fluxo completo e real: `MockMvc` → `TransactionController` → `PersistTransactionUseCase`/`ListTransactionsByCategoryUseCase` → `JpaTransactionRepository` → `TransactionEntityRepository` (Spring Data JPA) → banco H2 em memória, com resposta HTTP serializada de volta. Nenhum componente de negócio é mockado aqui; apenas o banco é isolado.
+- **Testes de resiliência da integração com IA** (`AiTransactionProcessorTest`, `OpenAiFailureHandlingTest`) — cobrem a classificação de falhas de transcrição/chat/voz e o mapeamento para `ProblemDetail` (ver [seção de falhas da integração com IA](#falhas-da-integração-com-ia)). Sem chamada real à OpenAI.
 
 **Banco de teste**: os testes de integração usam H2 em memória (`com.h2database:h2`, dependência apenas em `testRuntimeOnly`), configurado no perfil `test` (`src/test/resources/application-test.properties`, modo de compatibilidade MySQL, schema recriado via `ddl-auto=create-drop`). Não depende de MySQL local nem de Docker. Cada teste roda dentro de uma transação com rollback automático (`@Transactional`), garantindo isolamento sem necessidade de limpeza manual.
 

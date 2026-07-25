@@ -3,6 +3,7 @@ package dio.budgeting.infrastructure.http;
 import dio.budgeting.application.ListTransactionsByCategoryUseCase;
 import dio.budgeting.application.PersistTransactionUseCase;
 import dio.budgeting.domain.Category;
+import dio.budgeting.infrastructure.ai.AiTransactionProcessor;
 import dio.budgeting.infrastructure.http.audio.AudioFileValidator;
 import dio.budgeting.infrastructure.http.error.ApiErrorResponse;
 import dio.budgeting.infrastructure.http.request.TransactionRequest;
@@ -16,18 +17,12 @@ import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
-import org.springframework.ai.audio.transcription.TranscriptionModel;
-import org.springframework.ai.audio.tts.TextToSpeechModel;
-import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.core.io.Resource;
 import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.io.IOException;
-import java.nio.charset.Charset;
 import java.util.List;
 
 @RestController
@@ -37,27 +32,17 @@ public class TransactionController {
     private final PersistTransactionUseCase persistTransactionUseCase;
     private final ListTransactionsByCategoryUseCase listTransactionsByCategoryUseCase;
 
-    private final TranscriptionModel transcriptionModel;
-    private final ChatClient chatClient;
-    private final TextToSpeechModel textToSpeechModel;
     private final AudioFileValidator audioFileValidator;
+    private final AiTransactionProcessor aiTransactionProcessor;
 
     public TransactionController(PersistTransactionUseCase persistTransactionUseCase,
                                  ListTransactionsByCategoryUseCase listTransactionsByCategoryUseCase,
-                                 TranscriptionModel transcriptionModel,
-                                 @Value("classpath:prompts/system-message.st") Resource systemPrompt,
-                                 ChatClient.Builder chatClientBuilder,
-                                 TextToSpeechModel textToSpeechModel,
-                                 AudioFileValidator audioFileValidator) throws IOException {
+                                 AudioFileValidator audioFileValidator,
+                                 AiTransactionProcessor aiTransactionProcessor) {
         this.persistTransactionUseCase = persistTransactionUseCase;
         this.listTransactionsByCategoryUseCase = listTransactionsByCategoryUseCase;
-        this.transcriptionModel = transcriptionModel;
-        this.chatClient = chatClientBuilder
-                .defaultSystem(systemPrompt.getContentAsString(Charset.defaultCharset()))
-                .defaultTools(persistTransactionUseCase, listTransactionsByCategoryUseCase)
-                .build();
-        this.textToSpeechModel = textToSpeechModel;
         this.audioFileValidator = audioFileValidator;
+        this.aiTransactionProcessor = aiTransactionProcessor;
     }
 
     @Operation(
@@ -224,8 +209,88 @@ public class TransactionController {
                     )
             ),
             @ApiResponse(
+                    responseCode = "422",
+                    description = "Áudio recebido e válido, mas sem conteúdo de fala identificável na transcrição.",
+                    content = @Content(
+                            schema = @Schema(implementation = ApiErrorResponse.class),
+                            examples = @ExampleObject(
+                                    name = "Áudio não processável",
+                                    value = """
+                                            {
+                                              "type": "about:blank",
+                                              "title": "Áudio não processável",
+                                              "status": 422,
+                                              "detail": "Não foi possível identificar conteúdo falado no áudio.",
+                                              "instance": "/transactions/ai",
+                                              "timestamp": "2026-07-24T18:00:00-03:00"
+                                            }"""
+                            )
+                    )
+            ),
+            @ApiResponse(
+                    responseCode = "502",
+                    description = "Resposta inválida (vazia ou malformada) do ChatClient/TTS, ou falha genérica não "
+                            + "classificada na integração com a OpenAI.",
+                    content = @Content(
+                            schema = @Schema(implementation = ApiErrorResponse.class),
+                            examples = @ExampleObject(
+                                    name = "Resposta inválida do serviço de IA",
+                                    value = """
+                                            {
+                                              "type": "about:blank",
+                                              "title": "Resposta inválida do serviço de IA",
+                                              "status": 502,
+                                              "detail": "O serviço de inteligência artificial retornou uma resposta inválida.",
+                                              "instance": "/transactions/ai",
+                                              "timestamp": "2026-07-24T18:00:00-03:00"
+                                            }"""
+                            )
+                    )
+            ),
+            @ApiResponse(
+                    responseCode = "503",
+                    description = "Serviço de IA indisponível ou limite de requisições atingido no provedor. Nunca "
+                            + "repassado como 429 do próprio endpoint, já que o limite é do provedor, não da API.",
+                    content = @Content(
+                            schema = @Schema(implementation = ApiErrorResponse.class),
+                            examples = @ExampleObject(
+                                    name = "Serviço de IA temporariamente indisponível",
+                                    value = """
+                                            {
+                                              "type": "about:blank",
+                                              "title": "Serviço de IA temporariamente indisponível",
+                                              "status": 503,
+                                              "detail": "O serviço de inteligência artificial está temporariamente indisponível. Tente novamente mais tarde.",
+                                              "instance": "/transactions/ai",
+                                              "timestamp": "2026-07-24T18:00:00-03:00"
+                                            }"""
+                            )
+                    )
+            ),
+            @ApiResponse(
+                    responseCode = "504",
+                    description = "O provedor de IA (transcrição, chat ou geração de voz) demorou mais que o tempo "
+                            + "limite configurado para responder.",
+                    content = @Content(
+                            schema = @Schema(implementation = ApiErrorResponse.class),
+                            examples = @ExampleObject(
+                                    name = "Tempo limite excedido",
+                                    value = """
+                                            {
+                                              "type": "about:blank",
+                                              "title": "Tempo limite excedido",
+                                              "status": 504,
+                                              "detail": "O serviço de inteligência artificial demorou mais que o esperado para responder.",
+                                              "instance": "/transactions/ai",
+                                              "timestamp": "2026-07-24T18:00:00-03:00"
+                                            }"""
+                            )
+                    )
+            ),
+            @ApiResponse(
                     responseCode = "500",
-                    description = "Erro inesperado ao processar a requisição (transcrição, chat ou geração de voz).",
+                    description = "Erro inesperado, incluindo falha de configuração/credencial da OpenAI (nunca "
+                            + "exposta ao cliente).",
                     content = @Content(schema = @Schema(implementation = ApiErrorResponse.class))
             )
     })
@@ -243,10 +308,7 @@ public class TransactionController {
             @RequestParam("file") MultipartFile file) {
         audioFileValidator.validate(file);
 
-        var userMessage = transcriptionModel.transcribe(file.getResource());
-        var result = chatClient.prompt().user(userMessage).call().content();
-
-        byte[] audio = textToSpeechModel.call(result);
+        byte[] audio = aiTransactionProcessor.process(file.getResource());
         var resource = new ByteArrayResource(audio);
 
         return ResponseEntity.ok()

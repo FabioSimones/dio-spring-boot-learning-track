@@ -3,6 +3,7 @@ package dio.budgeting.infrastructure.http.error;
 import tools.jackson.databind.exc.InvalidFormatException;
 import dio.budgeting.domain.Category;
 import dio.budgeting.domain.InvalidTransactionException;
+import dio.budgeting.infrastructure.ai.AiIntegrationException;
 import dio.budgeting.infrastructure.http.audio.InvalidAudioFileException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
@@ -102,6 +103,29 @@ public class GlobalExceptionHandler {
                 ? HttpStatus.CONTENT_TOO_LARGE
                 : HttpStatus.BAD_REQUEST;
         var title = status == HttpStatus.CONTENT_TOO_LARGE ? "Arquivo muito grande" : "Arquivo de áudio inválido";
+        return problemDetail(status, title, ex.getMessage(), request);
+    }
+
+    @ExceptionHandler(AiIntegrationException.class)
+    public ProblemDetail handleAiIntegrationFailure(AiIntegrationException ex, HttpServletRequest request) {
+        log.warn("Falha na integração com IA. stage={} reason={} uri={}", ex.getStage(), ex.getReason(),
+                request.getRequestURI(), ex);
+
+        var status = switch (ex.getReason()) {
+            case TRANSCRIPTION_EMPTY -> HttpStatus.UNPROCESSABLE_CONTENT;
+            case TIMEOUT -> HttpStatus.GATEWAY_TIMEOUT;
+            case RATE_LIMITED, PROVIDER_UNAVAILABLE -> HttpStatus.SERVICE_UNAVAILABLE;
+            case INVALID_PROVIDER_RESPONSE, GENERIC_FAILURE -> HttpStatus.BAD_GATEWAY;
+            case CONFIGURATION_ERROR -> HttpStatus.INTERNAL_SERVER_ERROR;
+        };
+        var title = switch (ex.getReason()) {
+            case TRANSCRIPTION_EMPTY -> "Áudio não processável";
+            case TIMEOUT -> "Tempo limite excedido";
+            case RATE_LIMITED, PROVIDER_UNAVAILABLE -> "Serviço de IA temporariamente indisponível";
+            case INVALID_PROVIDER_RESPONSE -> "Resposta inválida do serviço de IA";
+            case GENERIC_FAILURE -> "Falha na integração com IA";
+            case CONFIGURATION_ERROR -> "Erro interno";
+        };
         return problemDetail(status, title, ex.getMessage(), request);
     }
 
