@@ -219,6 +219,30 @@ Todos os endpoints REST retornam erros em um contrato único e previsível, base
 
 - Falhas inesperadas retornam `500` com título `Erro interno` e mensagem genérica; o erro completo é registrado no servidor via SLF4J, nunca exposto ao cliente. Stack traces e mensagens técnicas nunca aparecem no corpo da resposta.
 
+## Testes automatizados
+
+O projeto combina três níveis de teste, cada um cobrindo uma responsabilidade diferente:
+
+- **Testes unitários** (`TransactionValidationTest`, `PersistTransactionUseCaseTest`, `MonetaryAmountBigDecimalTest`, `AudioFileValidatorTest`, `GlobalExceptionHandlerTest`) — validam regras de domínio, casos de uso e o handler de erros isoladamente, com mocks, sem subir o contexto Spring inteiro (ou subindo-o com `TransactionRepository`/beans de IA mockados).
+- **Testes HTTP com contrato mockado** (`TransactionControllerValidationTest`, `TransactionAudioUploadTest`, `SwaggerDocumentationTest`) — usam `MockMvc` contra o `TransactionController` real, mas com `TransactionRepository` mockado (`@MockitoBean`) e a autoconfiguração de JPA/DataSource excluída; comprovam o contrato HTTP (validação, status, `ProblemDetail`, documentação OpenAPI) sem tocar em persistência.
+- **Testes de integração REST** (`TransactionRestIntegrationTest`) — percorrem o fluxo completo e real: `MockMvc` → `TransactionController` → `PersistTransactionUseCase`/`ListTransactionsByCategoryUseCase` → `JpaTransactionRepository` → `TransactionEntityRepository` (Spring Data JPA) → banco H2 em memória, com resposta HTTP serializada de volta. Nenhum componente de negócio é mockado aqui; apenas o banco é isolado.
+
+**Banco de teste**: os testes de integração usam H2 em memória (`com.h2database:h2`, dependência apenas em `testRuntimeOnly`), configurado no perfil `test` (`src/test/resources/application-test.properties`, modo de compatibilidade MySQL, schema recriado via `ddl-auto=create-drop`). Não depende de MySQL local nem de Docker. Cada teste roda dentro de uma transação com rollback automático (`@Transactional`), garantindo isolamento sem necessidade de limpeza manual.
+
+**Sem chamadas à OpenAI**: os beans de IA (`ChatClient`, `TranscriptionModel`, `TextToSpeechModel`) sobem normalmente no contexto de teste com uma API key fictícia (`spring.ai.openai.api-key=test-key-not-a-real-credential`) — a simples construção desses beans não dispara chamada de rede. O endpoint `POST /transactions/ai` não é testado de ponta a ponta nesta suíte; apenas um teste de sanidade confirma que a rota existe e retorna `400` antes de qualquer chamada externa.
+
+Executar apenas a suíte de integração:
+
+```powershell
+.\gradlew.bat test --tests "dio.budgeting.TransactionRestIntegrationTest"
+```
+
+Executar todos os testes do módulo:
+
+```powershell
+.\gradlew.bat test
+```
+
 ## Notes
 
 - Educational final project focused on AI plus architectural discipline.
