@@ -5,8 +5,13 @@ import dio.budgeting.application.PersistTransactionUseCase;
 import dio.budgeting.domain.TransactionRepository;
 import dio.budgeting.infrastructure.ai.AiIntegrationException;
 import dio.budgeting.infrastructure.ai.AiTransactionProcessor;
+import dio.budgeting.infrastructure.ai.AiTransactionResult;
 import dio.budgeting.infrastructure.http.audio.AudioFileValidator;
 import dio.budgeting.infrastructure.http.audio.InvalidAudioFileException;
+import dio.budgeting.infrastructure.idempotency.AudioCommandIdempotencyService;
+import dio.budgeting.infrastructure.idempotency.AudioCommandOperationStore;
+import dio.budgeting.infrastructure.idempotency.IdempotencyDecision;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -18,6 +23,7 @@ import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
+import java.util.UUID;
 import java.util.stream.Stream;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -66,11 +72,25 @@ class OpenAiFailureHandlingTest {
     @MockitoBean
     AiTransactionProcessor aiTransactionProcessor;
 
+    @MockitoBean
+    AudioCommandIdempotencyService idempotencyService;
+
+    // Unused directly, but a real @Component that needs the JPA repository this
+    // test's context excludes - must be mocked too so the context can start.
+    @MockitoBean
+    AudioCommandOperationStore audioCommandOperationStore;
+
     @Autowired
     MockMvc mockMvc;
 
     private static MockMultipartFile audioFile() {
         return new MockMultipartFile("file", "audio.mp3", "audio/mpeg", new byte[]{1, 2, 3});
+    }
+
+    @BeforeEach
+    void stubIdempotencyAsNewOperation() {
+        when(idempotencyService.begin(any(), any()))
+                .thenReturn(new IdempotencyDecision.Start(UUID.randomUUID()));
     }
 
     static Stream<Arguments> failureReasons() {
@@ -98,6 +118,8 @@ class OpenAiFailureHandlingTest {
                 .andExpect(jsonPath("$.title").value(expectedTitle))
                 .andExpect(jsonPath("$.instance").value("/transactions/ai"))
                 .andExpect(jsonPath("$.timestamp").exists());
+
+        verify(idempotencyService).fail(any(), org.mockito.ArgumentMatchers.eq(AiIntegrationException.Stage.CHAT));
     }
 
     @Test
@@ -134,12 +156,14 @@ class OpenAiFailureHandlingTest {
     @Test
     void success_returnsAudioMp3() throws Exception {
         doNothing().when(audioFileValidator).validate(any());
-        when(aiTransactionProcessor.process(any())).thenReturn(new byte[]{1, 2, 3});
+        when(aiTransactionProcessor.process(any()))
+                .thenReturn(new AiTransactionResult(new byte[]{1, 2, 3}, "Transação registrada.", null));
 
         mockMvc.perform(multipart("/transactions/ai").file(audioFile()))
                 .andExpect(status().isOk());
 
         verify(audioFileValidator).validate(any());
         verify(aiTransactionProcessor).process(any());
+        verify(idempotencyService).complete(any(), org.mockito.ArgumentMatchers.eq("Transação registrada."), any());
     }
 }

@@ -2,6 +2,8 @@ package dio.budgeting;
 
 import dio.budgeting.domain.Transaction;
 import dio.budgeting.domain.TransactionRepository;
+import dio.budgeting.infrastructure.idempotency.AudioCommandIdempotencyService;
+import dio.budgeting.infrastructure.idempotency.AudioCommandOperationStore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -46,6 +48,14 @@ class TransactionControllerValidationTest {
 
     @MockitoBean
     TransactionRepository transactionRepository;
+
+    @MockitoBean
+    AudioCommandIdempotencyService idempotencyService;
+
+    // Unused directly, but a real @Component that needs the JPA repository this
+    // test's context excludes - must be mocked too so the context can start.
+    @MockitoBean
+    AudioCommandOperationStore audioCommandOperationStore;
 
     @Autowired
     MockMvc mockMvc;

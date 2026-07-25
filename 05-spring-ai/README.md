@@ -245,6 +245,32 @@ Um HTTP 429 do provedor **nunca** vira `429` na resposta desta API — o limite 
 
 **Testes**: `AiTransactionProcessorTest` (unitário, mocks de `TranscriptionModel`/`ChatClient`/`TextToSpeechModel`, sem chamada real) e `OpenAiFailureHandlingTest` (MockMvc, `AiTransactionProcessor` mockado como caixa-preta) cobrem toda a classificação acima. Nenhum teste usa API key real ou chama a OpenAI.
 
+## Idempotência do processamento por áudio
+
+`POST /transactions/ai` pode ser chamado mais de uma vez para o **mesmo comando de voz** (clique duplo, timeout percebido pelo cliente, queda de conexão, retry manual) — sem o header `Idempotency-Key`, cada reenvio repetiria transcrição, `ChatClient`/Tool Calling e a persistência da transação, podendo duplicá-la.
+
+**Uso**: envie um header `Idempotency-Key` (string opaca gerada pelo cliente, até 128 caracteres, apenas letras/números/`._:-`) com o mesmo valor para reenviar o *mesmo* comando:
+
+```bash
+curl -X POST \
+  http://localhost:8080/transactions/ai \
+  -H "Idempotency-Key: 3f18cfbe-6072-4e5c-b7a6-183ae1809846" \
+  -F "file=@comando.m4a;type=audio/mp4"
+```
+
+- **Header ausente** → `400` "Chave idempotente ausente".
+- **Formato inválido** (vazio, só espaços, acima de 128 caracteres, caracteres fora de `[A-Za-z0-9._:-]`) → `400` "Chave idempotente inválida".
+- **Mesma chave, mesmo arquivo, operação já concluída** → a resposta é reconstruída (novo TTS a partir do texto final já gerado) **sem** repetir transcrição, ChatClient ou Tool Calling. A resposta inclui o header `Idempotency-Replayed: true` (a primeira chamada retorna `false`).
+- **Mesma chave, arquivo diferente** → `409` "Chave idempotente em conflito" (a chave nunca é reaproveitada para um comando diferente).
+- **Mesma chave, operação ainda em processamento** (segunda requisição concorrente) → `409` "Operação em processamento".
+- **Mesma chave, falha anterior**: se a falha ocorreu na transcrição (nenhum efeito colateral possível ainda), a mesma chave pode ser reenviada normalmente. Se a falha ocorreu no chat ou na geração de voz (Tool Calling pode já ter persistido a transação), a chave fica bloqueada (`409` "Reprocessamento não permitido") — é necessário usar uma nova chave.
+
+**Concorrência**: a proteção real é uma constraint única de banco em `idempotency_key` (não uma checagem em memória). Duas requisições simultâneas com uma chave nova podem ambas passar pela checagem inicial; a constraint garante que só uma consegue persistir a operação, e a outra recebe "operação em processamento".
+
+**O que não é feito**: o áudio (enviado ou gerado) nunca é armazenado — apenas o texto final e seguro do ChatClient, usado para regenerar o áudio em um replay. Chaves não expiram nem são limpas nesta tarefa (ficam retidas indefinidamente); retenção/limpeza automática é uma limitação conhecida para uma tarefa futura.
+
+**Risco residual**: se o Tool Calling já persistiu a transação e a geração de voz falhar depois, a operação é marcada como falha bloqueada para retry — a transação criada não é desfeita automaticamente (sem compensação nesta tarefa).
+
 ## Testes automatizados
 
 O projeto combina três níveis de teste, cada um cobrindo uma responsabilidade diferente:
@@ -253,6 +279,7 @@ O projeto combina três níveis de teste, cada um cobrindo uma responsabilidade 
 - **Testes HTTP com contrato mockado** (`TransactionControllerValidationTest`, `TransactionAudioUploadTest`, `SwaggerDocumentationTest`) — usam `MockMvc` contra o `TransactionController` real, mas com `TransactionRepository` mockado (`@MockitoBean`) e a autoconfiguração de JPA/DataSource excluída; comprovam o contrato HTTP (validação, status, `ProblemDetail`, documentação OpenAPI) sem tocar em persistência.
 - **Testes de integração REST** (`TransactionRestIntegrationTest`) — percorrem o fluxo completo e real: `MockMvc` → `TransactionController` → `PersistTransactionUseCase`/`ListTransactionsByCategoryUseCase` → `JpaTransactionRepository` → `TransactionEntityRepository` (Spring Data JPA) → banco H2 em memória, com resposta HTTP serializada de volta. Nenhum componente de negócio é mockado aqui; apenas o banco é isolado.
 - **Testes de resiliência da integração com IA** (`AiTransactionProcessorTest`, `OpenAiFailureHandlingTest`) — cobrem a classificação de falhas de transcrição/chat/voz e o mapeamento para `ProblemDetail` (ver [seção de falhas da integração com IA](#falhas-da-integração-com-ia)). Sem chamada real à OpenAI.
+- **Testes de idempotência** (`AudioPayloadFingerprintTest`, `AudioCommandIdempotencyServiceTest`, `TransactionAudioIdempotencyTest`) — cobrem validação da chave, fingerprint SHA-256, replay/conflito/em-processamento/política de retry e a constraint única no H2 (ver [seção de idempotência](#idempotência-do-processamento-por-áudio)). Sem chamada real à OpenAI.
 
 **Banco de teste**: os testes de integração usam H2 em memória (`com.h2database:h2`, dependência apenas em `testRuntimeOnly`), configurado no perfil `test` (`src/test/resources/application-test.properties`, modo de compatibilidade MySQL, schema recriado via `ddl-auto=create-drop`). Não depende de MySQL local nem de Docker. Cada teste roda dentro de uma transação com rollback automático (`@Transactional`), garantindo isolamento sem necessidade de limpeza manual.
 

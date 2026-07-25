@@ -3,11 +3,15 @@ package dio.budgeting.infrastructure.http;
 import dio.budgeting.application.ListTransactionsByCategoryUseCase;
 import dio.budgeting.application.PersistTransactionUseCase;
 import dio.budgeting.domain.Category;
+import dio.budgeting.infrastructure.ai.AiIntegrationException;
 import dio.budgeting.infrastructure.ai.AiTransactionProcessor;
 import dio.budgeting.infrastructure.http.audio.AudioFileValidator;
 import dio.budgeting.infrastructure.http.error.ApiErrorResponse;
 import dio.budgeting.infrastructure.http.request.TransactionRequest;
 import dio.budgeting.infrastructure.http.response.TransactionResponse;
+import dio.budgeting.infrastructure.idempotency.AudioCommandIdempotencyService;
+import dio.budgeting.infrastructure.idempotency.AudioPayloadFingerprint;
+import dio.budgeting.infrastructure.idempotency.IdempotencyDecision;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.media.Content;
@@ -23,6 +27,7 @@ import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.IOException;
 import java.util.List;
 
 @RestController
@@ -34,15 +39,18 @@ public class TransactionController {
 
     private final AudioFileValidator audioFileValidator;
     private final AiTransactionProcessor aiTransactionProcessor;
+    private final AudioCommandIdempotencyService idempotencyService;
 
     public TransactionController(PersistTransactionUseCase persistTransactionUseCase,
                                  ListTransactionsByCategoryUseCase listTransactionsByCategoryUseCase,
                                  AudioFileValidator audioFileValidator,
-                                 AiTransactionProcessor aiTransactionProcessor) {
+                                 AiTransactionProcessor aiTransactionProcessor,
+                                 AudioCommandIdempotencyService idempotencyService) {
         this.persistTransactionUseCase = persistTransactionUseCase;
         this.listTransactionsByCategoryUseCase = listTransactionsByCategoryUseCase;
         this.audioFileValidator = audioFileValidator;
         this.aiTransactionProcessor = aiTransactionProcessor;
+        this.idempotencyService = idempotencyService;
     }
 
     @Operation(
@@ -161,7 +169,13 @@ public class TransactionController {
                     geração de voz).
 
                     O arquivo é validado localmente (tamanho máximo de 10 MB e content type entre os aceitos) antes \
-                    de qualquer chamada à OpenAI: um arquivo inválido nunca gera custo."""
+                    de qualquer chamada à OpenAI: um arquivo inválido nunca gera custo.
+
+                    Requer o header obrigatório Idempotency-Key (string opaca gerada pelo cliente, até 128 \
+                    caracteres, apenas letras/números/"._:-"). Reenviar a mesma chave com o mesmo arquivo nunca \
+                    repete transcrição/ChatClient/Tool Calling: a resposta é reconstruída (novo TTS) a partir do \
+                    texto já gerado. A mesma chave com um arquivo diferente, ou uma segunda requisição enquanto a \
+                    primeira ainda processa, retorna 409."""
     )
     @ApiResponses({
             @ApiResponse(
@@ -206,6 +220,40 @@ public class TransactionController {
                                               "timestamp": "2026-07-24T18:00:00-03:00"
                                             }"""
                             )
+                    )
+            ),
+            @ApiResponse(
+                    responseCode = "409",
+                    description = "Conflito de idempotência: mesma chave usada com outro arquivo, operação ainda "
+                            + "em processamento, ou falha anterior que impede reprocessamento seguro.",
+                    content = @Content(
+                            schema = @Schema(implementation = ApiErrorResponse.class),
+                            examples = {
+                                    @ExampleObject(
+                                            name = "Chave idempotente em conflito",
+                                            value = """
+                                                    {
+                                                      "type": "about:blank",
+                                                      "title": "Chave idempotente em conflito",
+                                                      "status": 409,
+                                                      "detail": "A chave de idempotência já foi utilizada com outro arquivo.",
+                                                      "instance": "/transactions/ai",
+                                                      "timestamp": "2026-07-24T18:00:00-03:00"
+                                                    }"""
+                                    ),
+                                    @ExampleObject(
+                                            name = "Operação em processamento",
+                                            value = """
+                                                    {
+                                                      "type": "about:blank",
+                                                      "title": "Operação em processamento",
+                                                      "status": 409,
+                                                      "detail": "Uma operação com esta chave já está em processamento.",
+                                                      "instance": "/transactions/ai",
+                                                      "timestamp": "2026-07-24T18:00:00-03:00"
+                                                    }"""
+                                    )
+                            }
                     )
             ),
             @ApiResponse(
@@ -297,6 +345,14 @@ public class TransactionController {
     @PostMapping(value = "/ai", consumes = MediaType.MULTIPART_FORM_DATA_VALUE, produces = "audio/mp3")
     ResponseEntity<Resource> transcribe(
             @Parameter(
+                    description = "Chave opaca gerada pelo cliente para evitar duplicação por reenvio/retry/"
+                            + "conexão perdida. Obrigatória, até 128 caracteres, apenas letras, números e '._:-'. "
+                            + "Deve ser reutilizada somente para o mesmo comando de voz (mesmo arquivo).",
+                    required = true,
+                    example = "3f18cfbe-6072-4e5c-b7a6-183ae1809846"
+            )
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
+            @Parameter(
                     description = "Arquivo de áudio com o comando financeiro falado. Obrigatório, até 10 MB, "
                             + "content type entre: audio/mpeg, audio/mp3, audio/mp4, audio/m4a, audio/x-m4a, "
                             + "audio/wav, audio/x-wav, audio/webm. Validado localmente antes de qualquer chamada à "
@@ -305,18 +361,38 @@ public class TransactionController {
                     required = true,
                     content = @Content(mediaType = MediaType.MULTIPART_FORM_DATA_VALUE)
             )
-            @RequestParam("file") MultipartFile file) {
+            @RequestParam("file") MultipartFile file) throws IOException {
         audioFileValidator.validate(file);
 
-        byte[] audio = aiTransactionProcessor.process(file.getResource());
-        var resource = new ByteArrayResource(audio);
+        byte[] audioBytes = file.getBytes();
+        String fingerprint = AudioPayloadFingerprint.of(audioBytes);
+        var decision = idempotencyService.begin(idempotencyKey, fingerprint);
 
+        byte[] responseAudio;
+        boolean replayed = decision instanceof IdempotencyDecision.Replay;
+        if (decision instanceof IdempotencyDecision.Replay replay) {
+            responseAudio = aiTransactionProcessor.regenerateAudio(replay.responseText());
+        } else {
+            var start = (IdempotencyDecision.Start) decision;
+            try {
+                var result = aiTransactionProcessor.process(new ByteArrayResource(audioBytes));
+                idempotencyService.complete(start.operationId(), result.responseText(), result.transactionId());
+                responseAudio = result.audio();
+            }
+            catch (AiIntegrationException ex) {
+                idempotencyService.fail(start.operationId(), ex.getStage());
+                throw ex;
+            }
+        }
+
+        var resource = new ByteArrayResource(responseAudio);
         return ResponseEntity.ok()
                 .header(HttpHeaders.CONTENT_DISPOSITION,
                         ContentDisposition.attachment()
                                 .filename("audio.mp3")
                                 .build()
                                 .toString())
+                .header("Idempotency-Replayed", String.valueOf(replayed))
                 .body(resource);
     }
 }

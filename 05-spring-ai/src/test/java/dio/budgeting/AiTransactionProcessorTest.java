@@ -72,9 +72,11 @@ class AiTransactionProcessorTest {
         when(callResponseSpec.content()).thenReturn("Transação registrada com sucesso.");
         when(textToSpeechModel.call(anyString())).thenReturn(new byte[]{1, 2, 3});
 
-        byte[] result = processor.process(AUDIO);
+        var result = processor.process(AUDIO);
 
-        assertThat(result).isEqualTo(new byte[]{1, 2, 3});
+        assertThat(result.audio()).isEqualTo(new byte[]{1, 2, 3});
+        assertThat(result.responseText()).isEqualTo("Transação registrada com sucesso.");
+        assertThat(result.transactionId()).isNull();
         InOrder order = inOrder(transcriptionModel, chatClient, textToSpeechModel);
         order.verify(transcriptionModel).transcribe(any());
         order.verify(chatClient).prompt();

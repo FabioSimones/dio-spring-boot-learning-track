@@ -1,6 +1,8 @@
 package dio.budgeting;
 
 import dio.budgeting.domain.TransactionRepository;
+import dio.budgeting.infrastructure.idempotency.AudioCommandIdempotencyService;
+import dio.budgeting.infrastructure.idempotency.AudioCommandOperationStore;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -40,6 +42,14 @@ class SwaggerDocumentationTest {
 
     @MockitoBean
     TransactionRepository transactionRepository;
+
+    @MockitoBean
+    AudioCommandIdempotencyService idempotencyService;
+
+    // Unused directly, but a real @Component that needs the JPA repository this
+    // test's context excludes - must be mocked too so the context can start.
+    @MockitoBean
+    AudioCommandOperationStore audioCommandOperationStore;
 
     @Autowired
     MockMvc mockMvc;

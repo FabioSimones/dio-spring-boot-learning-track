@@ -4,6 +4,8 @@ import dio.budgeting.application.PersistTransactionUseCase;
 import dio.budgeting.application.ListTransactionsByCategoryUseCase;
 import dio.budgeting.domain.InvalidTransactionException;
 import dio.budgeting.domain.TransactionRepository;
+import dio.budgeting.infrastructure.idempotency.AudioCommandIdempotencyService;
+import dio.budgeting.infrastructure.idempotency.AudioCommandOperationStore;
 import dio.budgeting.infrastructure.http.audio.InvalidAudioFileException;
 import dio.budgeting.infrastructure.http.error.GlobalExceptionHandler;
 import org.junit.jupiter.api.Test;
@@ -66,6 +68,14 @@ class GlobalExceptionHandlerTest {
 
     @MockitoBean
     TextToSpeechModel textToSpeechModel;
+
+    @MockitoBean
+    AudioCommandIdempotencyService idempotencyService;
+
+    // Unused directly, but a real @Component that needs the JPA repository this
+    // test's context excludes - must be mocked too so the context can start.
+    @MockitoBean
+    AudioCommandOperationStore audioCommandOperationStore;
 
     @Autowired
     MockMvc mockMvc;
@@ -428,5 +438,82 @@ class GlobalExceptionHandlerTest {
         assertThat(problem.getTitle()).isEqualTo("Erro interno");
         assertThat(problem.getDetail()).isEqualTo("O serviço de inteligência artificial não está disponível no momento.");
         assertThat(problem.getDetail()).doesNotContain("sk-test-sensitive", "API key", "RuntimeException");
+    }
+
+    // --- Idempotency failures (TASK-009, handler mapping: no MockMvc/context needed) ---
+
+    @Test
+    void idempotencyException_missingKey_returns400() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleIdempotencyFailure(new dio.budgeting.infrastructure.idempotency.IdempotencyException(
+                        dio.budgeting.infrastructure.idempotency.IdempotencyException.Reason.MISSING_KEY,
+                        "O header Idempotency-Key é obrigatório."),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(400);
+        assertThat(problem.getTitle()).isEqualTo("Chave idempotente ausente");
+        assertThat(problem.getDetail()).isEqualTo("O header Idempotency-Key é obrigatório.");
+        assertThat(problem.getInstance()).isEqualTo(URI.create("/transactions/ai"));
+        assertThat(problem.getProperties()).containsKey("timestamp");
+    }
+
+    @Test
+    void idempotencyException_invalidKey_returns400() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleIdempotencyFailure(new dio.budgeting.infrastructure.idempotency.IdempotencyException(
+                        dio.budgeting.infrastructure.idempotency.IdempotencyException.Reason.INVALID_KEY,
+                        "O header Idempotency-Key possui formato inválido."),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(400);
+        assertThat(problem.getTitle()).isEqualTo("Chave idempotente inválida");
+    }
+
+    @Test
+    void idempotencyException_payloadConflict_returns409_withoutExposingFingerprint() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleIdempotencyFailure(new dio.budgeting.infrastructure.idempotency.IdempotencyException(
+                        dio.budgeting.infrastructure.idempotency.IdempotencyException.Reason.PAYLOAD_CONFLICT,
+                        "A chave de idempotência já foi utilizada com outro arquivo."),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(409);
+        assertThat(problem.getTitle()).isEqualTo("Chave idempotente em conflito");
+        assertThat(problem.getDetail()).doesNotContainPattern("[0-9a-f]{64}");
+    }
+
+    @Test
+    void idempotencyException_inProgress_returns409() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleIdempotencyFailure(new dio.budgeting.infrastructure.idempotency.IdempotencyException(
+                        dio.budgeting.infrastructure.idempotency.IdempotencyException.Reason.IN_PROGRESS,
+                        "Uma operação com esta chave já está em processamento."),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(409);
+        assertThat(problem.getTitle()).isEqualTo("Operação em processamento");
+    }
+
+    @Test
+    void idempotencyException_retryNotAllowed_returns409() {
+        var handler = new GlobalExceptionHandler();
+        var request = new MockHttpServletRequest("POST", "/transactions/ai");
+
+        var problem = handler.handleIdempotencyFailure(new dio.budgeting.infrastructure.idempotency.IdempotencyException(
+                        dio.budgeting.infrastructure.idempotency.IdempotencyException.Reason.RETRY_NOT_ALLOWED,
+                        "Esta chave de idempotência falhou em uma etapa que pode já ter persistido uma transação. "
+                                + "Utilize uma nova chave para tentar novamente."),
+                request);
+
+        assertThat(problem.getStatus()).isEqualTo(409);
+        assertThat(problem.getTitle()).isEqualTo("Reprocessamento não permitido");
     }
 }

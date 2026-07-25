@@ -5,6 +5,7 @@ import dio.budgeting.domain.Category;
 import dio.budgeting.domain.InvalidTransactionException;
 import dio.budgeting.infrastructure.ai.AiIntegrationException;
 import dio.budgeting.infrastructure.http.audio.InvalidAudioFileException;
+import dio.budgeting.infrastructure.idempotency.IdempotencyException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -125,6 +126,22 @@ public class GlobalExceptionHandler {
             case INVALID_PROVIDER_RESPONSE -> "Resposta inválida do serviço de IA";
             case GENERIC_FAILURE -> "Falha na integração com IA";
             case CONFIGURATION_ERROR -> "Erro interno";
+        };
+        return problemDetail(status, title, ex.getMessage(), request);
+    }
+
+    @ExceptionHandler(IdempotencyException.class)
+    public ProblemDetail handleIdempotencyFailure(IdempotencyException ex, HttpServletRequest request) {
+        var status = switch (ex.getReason()) {
+            case MISSING_KEY, INVALID_KEY -> HttpStatus.BAD_REQUEST;
+            case PAYLOAD_CONFLICT, IN_PROGRESS, RETRY_NOT_ALLOWED -> HttpStatus.CONFLICT;
+        };
+        var title = switch (ex.getReason()) {
+            case MISSING_KEY -> "Chave idempotente ausente";
+            case INVALID_KEY -> "Chave idempotente inválida";
+            case PAYLOAD_CONFLICT -> "Chave idempotente em conflito";
+            case IN_PROGRESS -> "Operação em processamento";
+            case RETRY_NOT_ALLOWED -> "Reprocessamento não permitido";
         };
         return problemDetail(status, title, ex.getMessage(), request);
     }

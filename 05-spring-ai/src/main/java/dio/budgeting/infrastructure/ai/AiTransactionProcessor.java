@@ -59,10 +59,21 @@ public class AiTransactionProcessor {
         this.textToSpeechModel = textToSpeechModel;
     }
 
-    public byte[] process(Resource audioResource) {
+    public AiTransactionResult process(Resource audioResource) {
         String transcript = transcribe(audioResource);
         String reply = chat(transcript);
-        return synthesize(reply);
+        byte[] audio = synthesize(reply);
+        // transactionId is always null - see AiTransactionResult's javadoc.
+        return new AiTransactionResult(audio, reply, null);
+    }
+
+    /**
+     * Regenerates audio from an already-known, safe response text - used to
+     * replay a COMPLETED idempotent operation without repeating transcription,
+     * ChatClient or Tool Calling.
+     */
+    public byte[] regenerateAudio(String responseText) {
+        return synthesize(responseText);
     }
 
     private String transcribe(Resource audioResource) {
