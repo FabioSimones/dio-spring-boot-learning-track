@@ -141,7 +141,46 @@ Invalid request examples (all rejected):
 {"description": "Combustível", "amount": -10.00, "category": "AUTO"}
 ```
 
-There is **no standardized error response body yet** (no `@ControllerAdvice`) — invalid requests currently get Spring's default `400` error page/body. A structured, consistent error format is planned as a later evolution.
+## Tratamento de erros
+
+Todos os endpoints REST retornam erros em um contrato único e previsível, baseado no padrão nativo do Spring (`ProblemDetail`, RFC 9457), implementado por um `@RestControllerAdvice` (`GlobalExceptionHandler`) na camada de infraestrutura HTTP. A exceção de domínio (`InvalidTransactionException`) não conhece HTTP: quem traduz negócio em status code é sempre o handler global.
+
+**Campos comuns**: `type`, `title`, `status`, `detail`, `instance` (caminho da requisição), `timestamp` (ISO 8601). A propriedade `errors` (lista de `{field, message}`) só aparece quando há falhas de validação de campo.
+
+### Erros de validação (Bean Validation)
+
+`POST /transactions` com payload inválido retorna todos os erros de campo, ordenados por nome do campo:
+
+```json
+{
+  "title": "Dados inválidos",
+  "status": 400,
+  "detail": "Um ou mais campos possuem valores inválidos.",
+  "instance": "/transactions",
+  "errors": [
+    {
+      "field": "amount",
+      "message": "O valor da transação deve ser maior que zero."
+    }
+  ]
+}
+```
+
+### Categoria inválida
+
+- No corpo (`POST /transactions`), quando `category` não corresponde a um valor do enum, ou na rota (`GET /transactions/{category}`), a resposta indica os valores aceitos, por exemplo: `"Categoria inválida. Valores aceitos: GROCERIES, PHARMA, AUTO."`.
+
+### JSON inválido
+
+- JSON malformado ou tipos incompatíveis (ex.: `amount` como texto) retornam `400` com título `Requisição inválida` e uma mensagem genérica e segura — sem nomes de classes internas, caminhos ou detalhes do Jackson.
+
+### Arquivo ausente (`POST /transactions/ai`)
+
+- Requisição sem a parte `file` (ou não multipart) retorna `400` com título `Arquivo obrigatório` e detalhe `"O arquivo de áudio é obrigatório."`, sem acionar transcrição, ChatClient ou geração de voz.
+
+### Erro interno
+
+- Falhas inesperadas retornam `500` com título `Erro interno` e mensagem genérica; o erro completo é registrado no servidor via SLF4J, nunca exposto ao cliente. Stack traces e mensagens técnicas nunca aparecem no corpo da resposta.
 
 ## Notes
 

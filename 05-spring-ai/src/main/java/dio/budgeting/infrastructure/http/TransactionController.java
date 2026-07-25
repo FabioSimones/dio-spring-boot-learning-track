@@ -3,6 +3,7 @@ package dio.budgeting.infrastructure.http;
 import dio.budgeting.application.ListTransactionsByCategoryUseCase;
 import dio.budgeting.application.PersistTransactionUseCase;
 import dio.budgeting.domain.Category;
+import dio.budgeting.infrastructure.http.error.ApiErrorResponse;
 import dio.budgeting.infrastructure.http.request.TransactionRequest;
 import dio.budgeting.infrastructure.http.response.TransactionResponse;
 import io.swagger.v3.oas.annotations.Operation;
@@ -79,8 +80,34 @@ public class TransactionController {
             ),
             @ApiResponse(
                     responseCode = "400",
-                    description = "Payload inválido (descrição vazia, valor nulo/zero/negativo ou categoria nula). "
-                            + "Sem corpo de erro padronizado nesta etapa do projeto."
+                    description = "Payload inválido: descrição vazia, valor nulo/zero/negativo, categoria nula ou "
+                            + "inexistente, ou JSON malformado.",
+                    content = @Content(
+                            schema = @Schema(implementation = ApiErrorResponse.class),
+                            examples = @ExampleObject(
+                                    name = "Dados inválidos",
+                                    value = """
+                                            {
+                                              "type": "about:blank",
+                                              "title": "Dados inválidos",
+                                              "status": 400,
+                                              "detail": "Um ou mais campos possuem valores inválidos.",
+                                              "instance": "/transactions",
+                                              "timestamp": "2026-07-24T18:00:00-03:00",
+                                              "errors": [
+                                                {
+                                                  "field": "amount",
+                                                  "message": "O valor da transação deve ser maior que zero."
+                                                }
+                                              ]
+                                            }"""
+                            )
+                    )
+            ),
+            @ApiResponse(
+                    responseCode = "500",
+                    description = "Erro inesperado ao processar a requisição.",
+                    content = @Content(schema = @Schema(implementation = ApiErrorResponse.class))
             )
     })
     @PostMapping
@@ -94,11 +121,37 @@ public class TransactionController {
             summary = "Lista transações por categoria",
             description = "Retorna todas as transações persistidas para a categoria informada. Retorna lista vazia quando não há registros."
     )
-    @ApiResponse(
-            responseCode = "200",
-            description = "Lista de transações da categoria (pode ser vazia)",
-            content = @Content(schema = @Schema(implementation = TransactionResponse.class))
-    )
+    @ApiResponses({
+            @ApiResponse(
+                    responseCode = "200",
+                    description = "Lista de transações da categoria (pode ser vazia)",
+                    content = @Content(schema = @Schema(implementation = TransactionResponse.class))
+            ),
+            @ApiResponse(
+                    responseCode = "400",
+                    description = "Categoria inexistente no enum atual.",
+                    content = @Content(
+                            schema = @Schema(implementation = ApiErrorResponse.class),
+                            examples = @ExampleObject(
+                                    name = "Parâmetro inválido",
+                                    value = """
+                                            {
+                                              "type": "about:blank",
+                                              "title": "Parâmetro inválido",
+                                              "status": 400,
+                                              "detail": "O valor 'FOOD' não é válido para o parâmetro 'category'. Valores aceitos: GROCERIES, PHARMA, AUTO.",
+                                              "instance": "/transactions/FOOD",
+                                              "timestamp": "2026-07-24T18:00:00-03:00"
+                                            }"""
+                            )
+                    )
+            ),
+            @ApiResponse(
+                    responseCode = "500",
+                    description = "Erro inesperado ao processar a requisição.",
+                    content = @Content(schema = @Schema(implementation = ApiErrorResponse.class))
+            )
+    })
     @GetMapping("/{category}")
     public List<TransactionResponse> readTransactions(
             @Parameter(description = "Categoria da transação, conforme o enum atual do domínio", required = true)
@@ -118,11 +171,37 @@ public class TransactionController {
                     endpoint realiza 3 chamadas reais e potencialmente pagas à API da OpenAI (transcrição, chat e \
                     geração de voz)."""
     )
-    @ApiResponse(
-            responseCode = "200",
-            description = "Áudio MP3 com a resposta do assistente financeiro",
-            content = @Content(mediaType = "audio/mp3", schema = @Schema(type = "string", format = "binary"))
-    )
+    @ApiResponses({
+            @ApiResponse(
+                    responseCode = "200",
+                    description = "Áudio MP3 com a resposta do assistente financeiro",
+                    content = @Content(mediaType = "audio/mp3", schema = @Schema(type = "string", format = "binary"))
+            ),
+            @ApiResponse(
+                    responseCode = "400",
+                    description = "Requisição multipart inválida: parte 'file' ausente ou requisição não multipart.",
+                    content = @Content(
+                            schema = @Schema(implementation = ApiErrorResponse.class),
+                            examples = @ExampleObject(
+                                    name = "Arquivo obrigatório",
+                                    value = """
+                                            {
+                                              "type": "about:blank",
+                                              "title": "Arquivo obrigatório",
+                                              "status": 400,
+                                              "detail": "O arquivo de áudio é obrigatório.",
+                                              "instance": "/transactions/ai",
+                                              "timestamp": "2026-07-24T18:00:00-03:00"
+                                            }"""
+                            )
+                    )
+            ),
+            @ApiResponse(
+                    responseCode = "500",
+                    description = "Erro inesperado ao processar a requisição (transcrição, chat ou geração de voz).",
+                    content = @Content(schema = @Schema(implementation = ApiErrorResponse.class))
+            )
+    })
     @PostMapping(value = "/ai", consumes = MediaType.MULTIPART_FORM_DATA_VALUE, produces = "audio/mp3")
     ResponseEntity<Resource> transcribe(
             @Parameter(
