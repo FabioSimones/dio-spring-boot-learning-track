@@ -1,143 +1,410 @@
-# DIO Spring Boot - Final Project 05: Spring AI (budgeting)
+# Budgeting API com Spring Boot e Spring AI
 
-## Introduction
+![Java 25](https://img.shields.io/badge/Java-25-orange)
+![Spring Boot 4.0.5](https://img.shields.io/badge/Spring%20Boot-4.0.5-brightgreen)
+![Spring AI 2.0.0-M4](https://img.shields.io/badge/Spring%20AI-2.0.0--M4-brightgreen)
+![Gradle](https://img.shields.io/badge/build-Gradle-blue)
+![Tests: 292 passing](https://img.shields.io/badge/tests-292%20passing-success)
 
-This final module applies Spring AI in a budgeting API while preserving the same layered architecture used across the track.
+## Visão geral
 
-The goal is to integrate AI capabilities without bypassing domain and use case boundaries.
+Este módulo é o projeto final da trilha [DIO Spring Boot Learning Track](../README.md) (módulo `05-spring-ai`): uma API REST de controle financeiro pessoal (cadastro e consulta de transações) que evoluiu, ao longo de 13 tarefas incrementais, de um desafio educacional simples para um exemplo completo de **integração de IA em uma arquitetura em camadas disciplinada**.
 
-## Code Context
+O diferencial é o endpoint `POST /transactions/ai`: o usuário grava um comando de voz ("gastei 50 reais no mercado"), a API transcreve o áudio, interpreta a intenção com um `ChatClient` (Tool Calling), persiste a transação usando os **mesmos casos de uso** do fluxo REST tradicional, e devolve uma resposta falada em áudio. Em torno desse fluxo foram construídas, tarefa a tarefa: validação de upload, tratamento de erros padronizado, resiliência a falhas do provedor de IA, idempotência persistente com expiração/limpeza automática, observabilidade (logs, métricas, correlação), configuração segura por ambiente, e uma auditoria final de segurança e qualidade.
 
-The project processes voice commands to create and query financial transactions.
+**Importante**: este é um projeto educacional, não um sistema financeiro pronto para produção — não há autenticação/autorização, e diversas decisões (detalhadas na seção [Limitações](#limitações)) refletem escopo de aprendizado, não um produto real.
 
-Primary flow:
+## Sumário
 
-1. Client uploads an audio file.
-2. Audio is transcribed into text.
-3. The model selects an application tool/use case.
-4. The use case persists or queries transaction data.
-5. The final response is converted to audio.
+- [Funcionalidades](#funcionalidades)
+- [Tecnologias](#tecnologias)
+- [Arquitetura](#arquitetura)
+- [Fluxo REST tradicional](#fluxo-rest-tradicional)
+- [Fluxo com IA](#fluxo-com-ia)
+- [Endpoints](#endpoints)
+- [Exemplos de uso](#exemplos-de-uso)
+- [Erros HTTP](#erros-http)
+- [Upload de áudio](#upload-de-áudio)
+- [Valores monetários](#valores-monetários)
+- [Validações](#validações)
+- [Tratamento de erros](#tratamento-de-erros)
+- [Resiliência da integração com IA](#resiliência-da-integração-com-ia)
+- [Idempotência do processamento por áudio](#idempotência-do-processamento-por-áudio)
+- [Observabilidade](#observabilidade)
+- [Segurança](#segurança)
+- [Configuração por ambiente](#configuração-por-ambiente)
+- [Banco de dados](#banco-de-dados)
+- [Como executar](#como-executar)
+- [Swagger e Actuator](#swagger-e-actuator)
+- [Testes automatizados](#testes-automatizados)
+- [Estrutura do projeto](#estrutura-do-projeto)
+- [Decisões técnicas](#decisões-técnicas)
+- [Limitações](#limitações)
+- [Melhorias futuras](#melhorias-futuras)
+- [Contexto educacional](#contexto-educacional)
+- [Referências de arquitetura compartilhada](#referências-de-arquitetura-compartilhada)
 
-## Project Structure
+## Funcionalidades
 
-- `src/main/java/dio/budgeting/domain`
-  - Domain model and repository contract.
-- `src/main/java/dio/budgeting/application`
-  - Use cases used by both REST and AI tool calling.
-- `src/main/java/dio/budgeting/infrastructure`
-  - HTTP adapters, JPA adapters, and integration glue.
+- Cadastro de transações financeiras via REST (`POST /transactions`).
+- Consulta de transações por categoria (`GET /transactions/{category}`).
+- Registro de transações por comando de voz (`POST /transactions/ai`): transcrição, interpretação via `ChatClient`/Tool Calling, persistência e resposta falada.
+- Idempotência persistente por chave de cliente, com replay seguro, expiração e limpeza automática.
+- Retry controlado e classificação de falhas da integração com a OpenAI (timeout, indisponibilidade, resposta inválida).
+- Tratamento global de erros com contrato único (`ProblemDetail`, RFC 9457).
+- Observabilidade: correlação por requisição (`X-Correlation-ID`), métricas técnicas (Micrometer) e logs estruturados.
+- Configuração segura, separada por ambiente (`dev`/`test`/`prod`), sem segredo versionado.
+- Documentação interativa via Swagger/OpenAPI.
+- Suíte de testes automatizados (unitários, MVC, JPA/H2, configuração, segurança, métricas) — nenhum depende de MySQL, Docker ou de uma chamada real à OpenAI.
 
-## Module-Specific Topics
+## Tecnologias
 
-### Speech-to-text
+- Java 25
+- Spring Boot 4.0.5
+- Spring AI 2.0.0-M4 (`ChatClient`, `TranscriptionModel`, `TextToSpeechModel`, Tool Calling)
+- Spring MVC
+- Spring Data JPA
+- MySQL (desenvolvimento) / H2 (testes)
+- Gradle (Gradle Wrapper)
+- springdoc-openapi (Swagger UI / OpenAPI 3)
+- Micrometer + Spring Boot Actuator
+- JUnit 5, Mockito, MockMvc, AssertJ
 
-- Uses `TranscriptionModel` for audio transcription.
-- Model settings are configured in `application.properties`.
+## Arquitetura
 
-### Tool calling
+O módulo segue a mesma arquitetura em camadas usada no restante da trilha (ver [DDD Layered Architecture](../README.md#ddd-layered-architecture)), com a integração de IA e as preocupações técnicas (idempotência, observabilidade) isoladas em `infrastructure`, sem vazar para `domain`/`application`:
 
-- `ChatClient` registers use-case tools.
-- `@Tool` methods expose business capabilities to the model.
+```mermaid
+flowchart LR
+    Client[Cliente] --> Controller[TransactionController]
+    Controller --> Validator[AudioFileValidator]
+    Controller --> Idempotency[AudioCommandIdempotencyService]
+    Controller --> AiProcessor[AiTransactionProcessor]
+    AiProcessor --> Transcription[TranscriptionModel]
+    AiProcessor --> ChatClient
+    ChatClient --> ToolCalling["@Tool"]
+    ToolCalling --> UseCase[PersistTransactionUseCase]
+    UseCase --> Repository[(MySQL / H2)]
+    AiProcessor --> TTS[TextToSpeechModel]
+    Controller --> Observability[AiObservability / Micrometer]
+```
 
-### Text-to-speech
+- **`domain`**: `Transaction`, `Category`, `TransactionId`, `InvalidTransactionException` — sem dependência de Spring, HTTP, JPA ou Micrometer.
+- **`application`**: `PersistTransactionUseCase`, `ListTransactionsByCategoryUseCase` — usados tanto pelo REST tradicional quanto como `@Tool` do Tool Calling (mesma regra de negócio nos dois fluxos).
+- **`infrastructure.http`**: controller, filtro de correlação, validação de upload, tratamento global de erros.
+- **`infrastructure.ai`**: integração com os três modelos da OpenAI e classificação de falhas.
+- **`infrastructure.idempotency`**: chave idempotente, expiração, limpeza agendada.
+- **`infrastructure.observability`**: métricas Micrometer centralizadas.
+- **`infrastructure.persistence`**: adaptadores JPA.
+- **`infrastructure.config`**: Swagger/OpenAPI e validação de variáveis de ambiente obrigatórias.
 
-- `TextToSpeechModel` produces MP3 output from final text.
-- AI endpoint returns generated audio.
+## Fluxo REST tradicional
 
-## Spring AI Documentation
+**`POST /transactions`** — cadastra uma transação a partir de um payload JSON, sem áudio nem IA:
 
-- Spring AI Reference: https://docs.spring.io/spring-ai/reference/index.html
-- ChatModel API: https://docs.spring.io/spring-ai/reference/api/chatmodel.html
-- ChatClient API: https://docs.spring.io/spring-ai/reference/api/chatclient.html
-- Tools API: https://docs.spring.io/spring-ai/reference/api/tools.html
-- Audio Transcriptions API: https://docs.spring.io/spring-ai/reference/api/audio/transcriptions.html
-- Audio Speech API: https://docs.spring.io/spring-ai/reference/api/audio/speech.html
+1. Bean Validation (`@NotBlank`, `@DecimalMin` etc.) rejeita payloads obviamente inválidos com `400`.
+2. `PersistTransactionUseCase` reconstrói um `Transaction` de domínio, que valida novamente (fonte de verdade — ver [Validações](#validações)).
+3. A transação é persistida via `JpaTransactionRepository`.
+4. Resposta `201 Created` com o `TransactionResponse` (id, categoria, descrição, valor).
 
-## Shared Architecture References
+**`GET /transactions/{category}`** — lista transações de uma categoria:
 
-Common architecture concepts are documented in the root README:
+1. `category` é validado contra o enum `Category` (`GROCERIES`, `PHARMA`, `AUTO`); um valor fora do enum retorna `400`.
+2. `ListTransactionsByCategoryUseCase` consulta o repositório.
+3. Resposta `200 OK` com uma lista (vazia se não houver registros).
 
-- [DDD layers](../README.md#ddd-layered-architecture)
-- [Class vs record](../README.md#java-class-vs-java-record-in-domain-modeling)
-- [Strong typed identifiers](../README.md#strong-typed-identifiers)
-- [Repository pattern](../README.md#repository-pattern)
-- [Use cases and Clean Architecture](../README.md#use-cases-and-clean-architecture)
-- [Docker Compose support](../README.md#docker-compose-support-in-development)
+## Fluxo com IA
 
-## How to Run
+**`POST /transactions/ai`** — registra uma transação por comando de voz:
 
-Run the tests (no profile, no OpenAI call, no MySQL/Docker needed):
+```mermaid
+sequenceDiagram
+    participant C as Cliente
+    participant API as TransactionController
+    participant ID as Idempotência
+    participant AI as AiTransactionProcessor
+    participant DB as Banco
+
+    C->>API: áudio (multipart) + Idempotency-Key
+    API->>API: valida upload (tamanho, content type)
+    API->>ID: begin(chave, fingerprint SHA-256)
+    alt operação já concluída (replay)
+        ID-->>API: Replay(texto já gerado)
+        API->>AI: gerar áudio (TTS) a partir do texto
+    else operação nova
+        ID-->>API: Start(operationId)
+        API->>AI: transcrever áudio
+        AI-->>API: texto transcrito
+        API->>AI: ChatClient (Tool Calling)
+        AI->>DB: persist-transaction / list-transactions-by-category
+        AI->>AI: gerar áudio (TTS) da resposta final
+        API->>ID: complete(operationId, texto, ...)
+    end
+    API-->>C: audio/mp3 (+ Idempotency-Replayed, X-Correlation-ID)
+```
+
+Passo a passo:
+
+1. **Validação do upload** — tamanho e `content type` (ver [Upload de áudio](#upload-de-áudio)); um arquivo inválido nunca gera custo.
+2. **Validação da chave idempotente** — header `Idempotency-Key` obrigatório, formato restrito.
+3. **Fingerprint** — SHA-256 do conteúdo do áudio, usado para detectar reenvio do mesmo comando com o mesmo arquivo (nunca exposto em respostas ou logs).
+4. **Transcrição** — `TranscriptionModel` (whisper-1) converte áudio em texto.
+5. **ChatClient** — o texto é enviado ao modelo (gpt-4o-mini) com as tools disponíveis.
+6. **Tool Calling** — o modelo aciona `persist-transaction` ou `list-transactions-by-category`, que executam os **mesmos use cases** do fluxo REST.
+7. **Persistência** — ocorre dentro da tool, uma única vez por chamada.
+8. **TTS** — a resposta final do `ChatClient` é convertida em áudio (gpt-4o-mini-tts).
+9. **Resposta** — `audio/mp3`, com os headers `Idempotency-Replayed` (`true`/`false`) e `Cache-Control: no-store`.
+
+Se a chave já foi usada e a operação está concluída, os passos 4–7 são pulados e apenas o TTS roda novamente sobre o texto já gerado (replay).
+
+## Endpoints
+
+| Método | Endpoint | Descrição | Resposta de sucesso |
+| ------ | -------- | --------- | -------------------- |
+| `POST` | `/transactions` | Cadastra uma transação a partir de JSON | `201 Created` + `TransactionResponse` |
+| `GET` | `/transactions/{category}` | Lista transações de uma categoria (`GROCERIES`, `PHARMA`, `AUTO`) | `200 OK` + lista de `TransactionResponse` |
+| `POST` | `/transactions/ai` | Registra uma transação por comando de voz | `200 OK` + `audio/mp3` |
+
+Headers de `POST /transactions/ai`:
+
+| Header | Direção | Obrigatório | Descrição |
+| ------ | ------- | ----------: | --------- |
+| `Idempotency-Key` | Requisição | Sim | Chave opaca do cliente, até 128 caracteres, `[A-Za-z0-9._:-]` |
+| `X-Correlation-ID` | Requisição | Não | Identificador de correlação opcional (gerado se ausente/inválido) |
+| `Idempotency-Replayed` | Resposta | — | `true` se a resposta veio de replay, `false` se processada agora |
+| `X-Correlation-ID` | Resposta | — | Sempre devolvido, em sucesso ou erro |
+| `Cache-Control` | Resposta | — | `no-store` — a resposta de áudio nunca deve ser cacheada |
+
+## Exemplos de uso
+
+**Criar transação manual**:
 
 ```bash
-./gradlew test
+curl -X POST \
+  http://localhost:8080/transactions \
+  -H "Content-Type: application/json" \
+  -d '{"description": "Almoço", "amount": 42.90, "category": "GROCERIES"}'
 ```
 
-Run the application against a real MySQL/OpenAI (see [Configuração por ambiente](#configuração-por-ambiente) below for the full picture):
+**Consultar transações por categoria**:
 
 ```bash
-export SPRING_PROFILES_ACTIVE=dev
-export DB_URL=jdbc:mysql://localhost:3306/budgeting
-export DB_USERNAME=root
-export DB_PASSWORD="your-local-password"
-export OPENAI_API_KEY="your_api_key_here"
-./gradlew bootRun
+curl http://localhost:8080/transactions/GROCERIES
 ```
 
-Windows note: this repository's path contains `&`, which breaks `gradlew.bat`'s internal argument handling. If `.\gradlew.bat ...` fails with a garbled "not recognized as a command" error, invoke the wrapper jar directly instead:
+**Processar um comando de voz**:
 
-```powershell
-java -jar gradle\wrapper\gradle-wrapper.jar test
-java -jar gradle\wrapper\gradle-wrapper.jar bootRun
+```bash
+curl -X POST \
+  http://localhost:8080/transactions/ai \
+  -H "Idempotency-Key: comando-001" \
+  -H "X-Correlation-ID: teste-local-001" \
+  -F "file=@comando.m4a;type=audio/mp4" \
+  --output resposta.mp3
 ```
+
+Nenhum exemplo acima requer ou expõe uma API key — a chave da OpenAI é configurada apenas no servidor, via variável de ambiente (ver [Variáveis de ambiente](#variáveis-de-ambiente)).
+
+## Erros HTTP
+
+| Status | Situação |
+| -----: | -------- |
+| 400 | Payload/JSON inválido, categoria inexistente, chave idempotente ausente/inválida, upload ausente/vazio/tipo não permitido |
+| 404 | Rota inexistente |
+| 409 | Conflito de idempotência: mesmo chave com arquivo diferente, operação em processamento, ou retry inseguro bloqueado |
+| 413 | Arquivo de áudio acima do limite (10 MB por padrão) |
+| 422 | Áudio sem conteúdo de fala identificável na transcrição |
+| 500 | Erro inesperado, ou falha de configuração/credencial da OpenAI (nunca exposta ao cliente) |
+| 502 | Resposta vazia/inválida do ChatClient ou TTS, ou falha não classificada da integração |
+| 503 | Provedor de IA indisponível ou limite de requisições atingido (429 do provedor nunca vira 429 desta API) |
+| 504 | Timeout na chamada ao provedor de IA |
+
+Todas seguem o contrato `ProblemDetail` (RFC 9457): `type`, `title`, `status`, `detail`, `instance`, `timestamp`, e `errors` (lista de `{field, message}`) quando há falha de validação de campo. Stack traces e mensagens técnicas internas nunca aparecem no corpo da resposta.
+
+## Upload de áudio
+
+`POST /transactions/ai` recebe o comando de voz como `multipart/form-data`, na parte obrigatória `file`.
+
+Antes de qualquer chamada à OpenAI (transcrição, ChatClient, geração de voz), o arquivo é validado localmente por `AudioFileValidator`:
+
+1. arquivo presente e não vazio;
+2. tamanho dentro do limite (`app.audio.max-size`, padrão **10 MB**, sobrescrevível por `AUDIO_MAX_SIZE`);
+3. `content type` presente;
+4. `content type` entre os aceitos: `audio/mpeg`, `audio/mp3`, `audio/mp4`, `audio/m4a`, `audio/x-m4a`, `audio/wav`, `audio/x-wav`, `audio/webm`.
+
+Um arquivo que falhe em qualquer uma dessas regras é rejeitado **sem gerar custo**: nenhuma chamada a `TranscriptionModel`, `ChatClient` ou `TextToSpeechModel` ocorre para um upload inválido.
+
+**Atenção**: esta validação verifica apenas o `content type` declarado pelo cliente, não o conteúdo binário do arquivo — um arquivo renomeado (ex.: `.exe` enviado como `audio/mpeg`) não é detectado. O nome do arquivo nunca é usado para operações de sistema de arquivos (sem risco de path traversal). Uploads que passam na validação ainda geram chamadas reais e potencialmente pagas à API da OpenAI.
+
+## Valores monetários
+
+- `amount` é representado como `BigDecimal`, em **reais**, sempre normalizado para **duas casas decimais** (`RoundingMode.HALF_UP`), do domínio (`Transaction`) até a persistência (`DECIMAL(19,2)`) e as respostas REST/Tool Calling.
+- Exemplo: `{"description": "Combustível", "amount": 80.90, "category": "AUTO"}` → resposta `{"id": "...", "category": "AUTO", "description": "Combustível", "amount": 80.90}`.
+- Valores são arredondados, não truncados, quando têm mais de duas casas (ex.: `80.905` vira `80.91`).
+- **Nota sobre banco local**: se um MySQL local já estava rodando com uma coluna `BIGINT` antiga, o schema não é migrado automaticamente de forma segura (`ddl-auto=update` não converte `BIGINT` para `DECIMAL`). Recrie o banco de desenvolvimento local (ou execute `ALTER TABLE` manualmente) antes de rodar contra um schema pré-existente.
+
+## Validações
+
+As invariantes de negócio são aplicadas centralmente no domínio (`Transaction`), então tanto o REST quanto o Tool Calling passam pela mesma proteção — as regras não dependem apenas de anotações do controller/DTO:
+
+- **Descrição**: obrigatória, não pode ser nula/vazia/em branco; espaços nas pontas são removidos.
+- **Valor**: obrigatório, deve ser maior que zero **após** normalização para duas casas (`HALF_UP`) — ex.: `0.004` arredonda para `0.00` e é rejeitado, enquanto `0.005` arredonda para `0.01` e é aceito.
+- **Categoria**: obrigatória, restrita aos valores atuais do enum (`GROCERIES`, `PHARMA`, `AUTO`).
+
+Entrada inválida lança `InvalidTransactionException` (exceção de domínio, sem conceito de HTTP) antes de qualquer chamada ao repositório. Anotações de Bean Validation (`@NotBlank`, `@NotNull`, `@DecimalMin`) foram adicionadas a `TransactionRequest` como uma primeira barreira HTTP — mas essa é uma camada de conveniência, não a fonte da verdade.
+
+## Tratamento de erros
+
+Todos os endpoints REST retornam erros em um contrato único e previsível, baseado no padrão nativo do Spring (`ProblemDetail`, RFC 9457), implementado por um `@RestControllerAdvice` (`GlobalExceptionHandler`). A exceção de domínio (`InvalidTransactionException`) não conhece HTTP: quem traduz negócio em status code é sempre o handler global.
+
+- Erros de validação retornam a lista completa de campos inválidos, ordenada por nome do campo.
+- Categoria inválida (no corpo ou na rota) indica os valores aceitos na mensagem.
+- JSON malformado retorna `400` com mensagem genérica e segura — sem nomes de classes internas, caminhos ou detalhes do Jackson.
+- Rotas inexistentes retornam `404` (ex.: `/actuator/env`, quando não exposto).
+- Falhas inesperadas retornam `500` com mensagem genérica; o erro completo é registrado no servidor via SLF4J, nunca exposto ao cliente.
+
+## Resiliência da integração com IA
+
+`POST /transactions/ai` encadeia três chamadas externas — transcrição, `ChatClient` (com Tool Calling) e geração de voz — cada uma classificada e traduzida para um `ProblemDetail` padronizado, via `AiIntegrationException` lançada por `AiTransactionProcessor`.
+
+| Etapa | Motivo | Status |
+| --- | --- | -----: |
+| Transcrição | áudio sem fala identificável | 422 |
+| Qualquer etapa | timeout de conexão/leitura | 504 |
+| Qualquer etapa | limite de requisições do provedor (HTTP 429) | 503 |
+| Qualquer etapa | provedor indisponível (HTTP 5xx, conexão recusada) | 503 |
+| Chat / TTS | resposta vazia ou estruturalmente inválida | 502 |
+| Qualquer etapa | falha externa não classificada | 502 |
+| Qualquer etapa | credencial/configuração inválida (HTTP 401/403) | 500 |
+
+Um HTTP 429 do provedor **nunca** vira `429` na resposta desta API — o limite é da conta OpenAI, não da API local.
+
+- **Timeout**: `spring.http.clients.connect-timeout`/`read-timeout` (10s/60s por padrão, `AI_CONNECT_TIMEOUT`/`AI_READ_TIMEOUT`) — configuração global, compartilhada pelos três modelos.
+- **Retry**: `spring-ai-retry` retenta automaticamente falhas transitórias (5xx, timeout/conexão) via um `RetryTemplate` compartilhado. Isso **não duplica Tool Calling**: o retry atua só na chamada HTTP; a execução do `@Tool` é um método Java local, disparado uma única vez por `tool_call`. Tentativas limitadas a `spring.ai.retry.max-attempts=2` (`AI_RETRY_MAX_ATTEMPTS`). HTTP 4xx nunca é retentado automaticamente.
+- **Tool Calling e domínio**: uma exceção de domínio lançada pelas tools (`InvalidTransactionException`) é convertida em texto e devolvida ao modelo como resultado da tool — nunca propaga como exceção Java. Um comando inválido (ex.: valor zero) vira uma resposta em áudio explicando o problema, não um erro de integração.
+- **Risco residual sem idempotência**: se o Tool Calling já persistiu a transação e a geração de voz falhar depois, a API retorna um erro (502/503/504) mesmo com a transação salva — mitigado (não eliminado) pela idempotência, ver seção abaixo.
+
+## Idempotência do processamento por áudio
+
+`POST /transactions/ai` pode ser chamado mais de uma vez para o **mesmo comando de voz** (clique duplo, timeout percebido pelo cliente, queda de conexão, retry manual). O header `Idempotency-Key` (string opaca do cliente, até 128 caracteres, `[A-Za-z0-9._:-]`) evita repetir transcrição/Tool Calling/persistência.
+
+| Cenário | Comportamento |
+| ------- | ------------- |
+| Header ausente | `400` "Chave idempotente ausente" |
+| Formato inválido | `400` "Chave idempotente inválida" |
+| Mesma chave, mesmo arquivo, operação concluída | Replay: novo TTS a partir do texto já gerado, `Idempotency-Replayed: true` |
+| Mesma chave, arquivo diferente | `409` "Chave idempotente em conflito" |
+| Mesma chave, operação ainda em processamento | `409` "Operação em processamento" |
+| Falha anterior na transcrição | Retry permitido com a mesma chave |
+| Falha anterior no chat/TTS | `409` "Reprocessamento não permitido" — chave bloqueada, use uma nova |
+| Chave expirada e removida | Tratada como operação nova (ver expiração abaixo) |
+
+**Aviso importante**: a garantia idempotente é limitada à janela de retenção configurada. Após a expiração e remoção do registro, a mesma chave pode ser tratada como uma nova operação.
+
+**Concorrência**: a proteção real é uma constraint única de banco em `idempotency_key` (não uma checagem em memória). O SHA-256 do conteúdo do áudio (fingerprint) nunca é exposto em respostas ou logs. O áudio (enviado ou gerado) nunca é armazenado.
+
+### Expiração e limpeza
+
+| Estado | Janela (padrão) | Ação após expiração |
+| ------ | ---------------- | -------------------- |
+| `COMPLETED` | 24h (`IDEMPOTENCY_COMPLETED_RETENTION`) | Removida; a chave pode iniciar uma nova operação |
+| `FAILED` (qualquer estágio) | 24h (`IDEMPOTENCY_FAILED_RETENTION`) | Removida; a chave pode iniciar uma nova operação |
+| `PROCESSING` | 15 min de inatividade (`IDEMPOTENCY_PROCESSING_TIMEOUT`) | Considerada abandonada e recuperada (nunca reprocessada automaticamente) |
+
+Operações `PROCESSING` abandonadas (ex.: a aplicação caiu no meio do processamento) são recuperadas com base no estágio alcançado (`currentStage`): se Tool Calling ainda não rodou (`REGISTERED`/`TRANSCRIPTION`), a chave permite retry; se pode já ter rodado (`CHAT`/`SPEECH`, ou estágio desconhecido), o retry continua bloqueado. Essa recuperação acontece tanto oportunisticamente (dentro do próprio `begin()`, sem esperar o scheduler) quanto periodicamente (`IdempotencyCleanupScheduler`, `@Scheduled`, gated por `IDEMPOTENCY_CLEANUP_ENABLED`).
+
+Concorrência entre scheduler e requisição é resolvida por lock otimista (`@Version`); entre limpeza e replay, pela releitura do `responseText` antes de qualquer exclusão, e por uma exclusão em lote que revalida `status`+`updatedAt` no momento do delete.
+
+## Observabilidade
+
+Correlação, logs estruturados e métricas técnicas — puramente aditivo: nada aqui influencia o resultado de uma requisição.
+
+- **`X-Correlation-ID`**: opcional na requisição (reaproveitado se seguro; UUID gerado caso contrário), sempre devolvido na resposta (sucesso ou erro), disponível no MDC (`correlationId`) durante toda a requisição, sempre limpo no `finally`.
+
+| Métrica | Finalidade |
+| ------- | ---------- |
+| `budgeting.ai.requests` | Duração total do endpoint (Timer; inclui replay) |
+| `budgeting.ai.stage.duration` | Duração de transcrição/chat/TTS (Timer) |
+| `budgeting.ai.failures` | Falhas por etapa e motivo classificado (Counter) |
+| `budgeting.ai.upload.rejections` | Arquivos rejeitados antes de qualquer chamada à OpenAI (Counter) |
+| `budgeting.ai.idempotency.operations` | Operações iniciadas (Counter) |
+| `budgeting.ai.idempotency.replays` | Replays idempotentes (Counter) |
+| `budgeting.ai.idempotency.conflicts` | Conflitos de idempotência (Counter) |
+| `budgeting.idempotency.cleanup` | Operações recuperadas/removidas pelo scheduler (Counter) |
+
+**Nunca registrados** em logs ou métricas: áudio, bytes do arquivo, transcrição, prompt, resposta completa da IA, `Idempotency-Key`, fingerprint, API key, senha. Todas as tags de métrica vêm de enums fechados ou literais fixos — nunca correlation ID, chave, fingerprint, nome de arquivo, mensagem de exceção ou URI dinâmica. O stack trace de uma falha de IA é logado exatamente uma vez (na camada que classifica).
+
+## Segurança
+
+- **Segredos apenas por variável de ambiente** — nenhuma chave, senha ou token versionado (ver [Configuração por ambiente](#configuração-por-ambiente)).
+- **Upload limitado e validado** antes de qualquer custo com a OpenAI.
+- **Validações centralizadas** no domínio, não apenas em anotações HTTP.
+- **Respostas de erro seguras**: `ProblemDetail` padronizado, sem stack trace, sem mensagem técnica interna.
+- **`Cache-Control: no-store`** na resposta de áudio de `/transactions/ai` — evita retenção por proxies/caches intermediários de uma resposta financeira/pessoal.
+- **Actuator restrito**: apenas `health` (sem detalhes) e `metrics` expostos fora de produção; só `health` em produção. `env`, `beans`, `configprops`, `heapdump` nunca expostos.
+- **Swagger desabilitado** no exemplo de configuração de produção.
+- **Nenhum segredo em log** — verificado estaticamente por `VersionedSecretsTest`.
+
+**Limitações de segurança** (ver também [Limitações](#limitações)): sem autenticação, sem autorização, sem proteção completa contra prompt injection na transcrição — este é um projeto educacional, não deve ser exposto publicamente sem essas camadas.
 
 ## Configuração por ambiente
 
-Configuration is split by environment (TASK-012) so no secret is ever versioned and each environment fails predictably instead of silently misbehaving.
+Configuração organizada por ambiente para que nenhum segredo seja versionado e cada ambiente falhe de forma previsível.
 
-### Estrutura de arquivos
+| Arquivo | Carregado quando |
+| --- | --- |
+| `application.properties` | Sempre (base comum — sem chave OpenAI, sem datasource, sem perfil ativo) |
+| `application-dev.properties` | `SPRING_PROFILES_ACTIVE=dev` |
+| `application-prod.properties.example` | **Nunca automaticamente** (extensão `.example`) |
+| `application-test.properties` | Perfil `test` (usado pela suíte de testes) |
+| `.env.example` | **Nunca automaticamente** (não há suporte a dotenv) |
 
-| Arquivo | Carregado quando | Contém segredo? |
-| --- | --- | --- |
-| `src/main/resources/application.properties` | Sempre (base comum) | Não — sem chave OpenAI, sem datasource, sem perfil ativo |
-| `src/main/resources/application-dev.properties` | `SPRING_PROFILES_ACTIVE=dev` | Não — só `${VAR}` e defaults locais não sensíveis (`localhost`, `root`) |
-| `src/main/resources/application-prod.properties.example` | **Nunca automaticamente** (extensão `.example`) | Não — apenas documentação/placeholders |
-| `src/test/resources/application-test.properties` | Perfil `test` (usado pela suíte de testes) | Não — H2 em memória, chave `test-key-not-a-real-credential` explicitamente fictícia |
-| `.env.example` | **Nunca automaticamente** (não há suporte a dotenv no projeto) | Não — apenas documentação |
+| Configuração | Dev | Test | Prod (`.example`) |
+| --- | --- | --- | --- |
+| Datasource | MySQL (`DB_URL`/`DB_USERNAME` com default local; `DB_PASSWORD` obrigatório) | H2 em memória | MySQL (tudo obrigatório, sem default) |
+| `ddl-auto` | `update` | `create-drop` | `validate` |
+| OpenAI key | obrigatória (`OPENAI_API_KEY`) | fictícia | obrigatória |
+| Swagger | habilitado | habilitado | **desabilitado** |
+| Actuator metrics | ligado | ligado | **desligado** |
+| Scheduler de limpeza | ligado | **desligado** | ligado |
 
-**Importante**: rodar sem nenhum perfil ativo carrega só o arquivo comum — isso é proposital, não um esquecimento. Sem `spring.ai.openai.api-key`, a própria autoconfiguração do Spring AI recusa a criação dos beans de IA (`OpenAI API key must be set...`), então a aplicação completa não sobe sem `dev`, `test` ou um perfil de produção equivalente ativo.
-
-### Matriz de configuração
-
-| Categoria | Common | Dev | Test | Prod (`.example`) |
-| --- | --- | --- | --- | --- |
-| Datasource | — | MySQL (`DB_URL`/`DB_USERNAME` com default `localhost`; `DB_PASSWORD` obrigatório) | H2 em memória | MySQL (tudo obrigatório, sem default) |
-| `ddl-auto` | — | `update` | `create-drop` | `validate` |
-| OpenAI key | — (ausente) | obrigatória (`${OPENAI_API_KEY}`, sem default) | fictícia (`test-key-not-a-real-credential`) | obrigatória (`${OPENAI_API_KEY}`, sem default) |
-| Swagger | habilitado (padrão do springdoc) | habilitado | habilitado | **desabilitado** (`springdoc.*.enabled=false`) |
-| Actuator health | ligado | ligado | ligado | ligado |
-| Actuator metrics | ligado (baseline) | ligado | ligado | **desligado** |
-| Scheduler de limpeza | ligado (padrão) | ligado | **desligado** (`app.idempotency.cleanup-enabled=false`) | ligado |
-| Log level (root) | `INFO` | `INFO` (+ `DEBUG` só em `org.springframework.ai`/`dio.budgeting`) | `INFO` | `INFO` |
+`application-prod.properties.example` **não é carregado automaticamente** — é documentação. Para produção, provisione `DB_URL`/`DB_USERNAME`/`DB_PASSWORD`/`OPENAI_API_KEY` como variáveis de ambiente reais (secret manager, CI/CD etc. — fora do escopo aqui) e replique as propriedades do `.example` onde sua aplicação realmente lê `application-prod.properties`; nunca copie o arquivo com um segredo dentro dele para o controle de versão. `EnvironmentConfigurationValidator` falha o startup com mensagem clara se qualquer uma das quatro variáveis estiver ausente em `dev`/`prod`.
 
 ### Variáveis de ambiente
 
 | Variável | Obrigatória | Perfil | Descrição |
 | --- | ---: | --- | --- |
-| `SPRING_PROFILES_ACTIVE` | Não | Todos | Seleciona `dev`/`prod`; deixe vazio para só a configuração comum, ou use `docker compose up` sem definir nada |
-| `DB_URL` | Sim* | `dev`, `prod` | URL JDBC do MySQL (*em `dev` tem default `jdbc:mysql://localhost:3306/budgeting`) |
-| `DB_USERNAME` | Sim* | `dev`, `prod` | Usuário do MySQL (*em `dev` tem default `root`) |
-| `DB_PASSWORD` | Sim | `dev`, `prod` | Senha do MySQL — sem default em nenhum perfil |
-| `OPENAI_API_KEY` | Sim | `dev`, `prod` | Chave da API OpenAI — sem default em nenhum perfil |
-| `AUDIO_MAX_SIZE` | Não | Todos | Override do limite de upload (padrão `10MB`) |
-| `AI_CONNECT_TIMEOUT` / `AI_READ_TIMEOUT` | Não | Todos | Overrides de timeout HTTP para OpenAI (padrão `10s`/`60s`) |
+| `SPRING_PROFILES_ACTIVE` | Não | Todos | Seleciona `dev`/`prod`; vazio = só configuração comum |
+| `DB_URL` | Sim* | `dev`, `prod` | URL JDBC do MySQL (*`dev` tem default local) |
+| `DB_USERNAME` | Sim* | `dev`, `prod` | Usuário do MySQL (*`dev` tem default `root`) |
+| `DB_PASSWORD` | Sim | `dev`, `prod` | Senha do MySQL — sem default |
+| `OPENAI_API_KEY` | Sim | `dev`, `prod` | Chave da API OpenAI — sem default |
+| `AUDIO_MAX_SIZE` | Não | Todos | Limite de upload (padrão `10MB`) |
+| `AI_CONNECT_TIMEOUT` / `AI_READ_TIMEOUT` | Não | Todos | Timeouts HTTP para OpenAI (padrão `10s`/`60s`) |
 | `AI_RETRY_MAX_ATTEMPTS` | Não | Todos | Tentativas do `spring-ai-retry` (padrão `2`) |
-| `IDEMPOTENCY_COMPLETED_RETENTION` / `IDEMPOTENCY_FAILED_RETENTION` / `IDEMPOTENCY_PROCESSING_TIMEOUT` / `IDEMPOTENCY_CLEANUP_ENABLED` | Não | Todos | Overrides da política de idempotência (ver [seção de expiração e limpeza](#expiração-e-limpeza-task-010)) |
+| `IDEMPOTENCY_COMPLETED_RETENTION` / `IDEMPOTENCY_FAILED_RETENTION` / `IDEMPOTENCY_PROCESSING_TIMEOUT` / `IDEMPOTENCY_CLEANUP_ENABLED` | Não | Todos | Overrides da política de idempotência |
 
-### Execução local
+Nenhum valor real aparece acima — todos são nomes de variável ou exemplos ilustrativos.
 
-**Via Docker Compose** (mais simples, sem precisar de `SPRING_PROFILES_ACTIVE`): o `spring-boot-docker-compose` (dependência `developmentOnly`, ausente do artefato de produção) detecta `compose.yml` e conecta automaticamente ao MySQL do container. Basta configurar `OPENAI_API_KEY` e rodar `./gradlew bootRun` — nenhuma outra variável é necessária. (`compose.yml` usa credenciais triviais de desenvolvimento local, já versionadas antes desta tarefa; Docker Compose está fora do escopo desta tarefa.)
+## Banco de dados
 
-**Via perfil `dev`** (MySQL próprio, gerenciado por você):
+- **`dev`**: MySQL, via `DB_URL`/`DB_USERNAME`/`DB_PASSWORD`, `ddl-auto=update` (conveniente para iterar localmente, mas pode aplicar mudanças destrutivas silenciosamente — não é migração versionada).
+- **`test`**: H2 em memória, `MODE=MySQL`, `ddl-auto=create-drop` (schema recriado a cada execução). H2 em modo de compatibilidade MySQL não é equivalente total ao MySQL real (tipos, funções e comportamento de constraint podem divergir sutilmente).
+- **`prod.example`**: MySQL, `ddl-auto=validate` (só detecta divergência de schema, não corrige).
+- O projeto **não usa Flyway/Liquibase** — não há migração versionada; `ddl-auto` não substitui isso.
+- `compose.yml` sobe um MySQL local via Docker (credenciais triviais de desenvolvimento, já versionadas) com porta `3307` e banco `transaction`; isso é independente do perfil `dev` (que usa por padrão porta `3306`/banco `budgeting`) — não combine os dois sem ajustar as variáveis, veja [Como executar](#como-executar).
+
+## Como executar
+
+**Pré-requisitos**: Java 25, Gradle Wrapper (incluso), um MySQL acessível (via `compose.yml` ou instância própria) e uma API key da OpenAI para o fluxo de IA.
+
+Rodar os testes (nenhum profile, nenhuma chamada à OpenAI, sem MySQL/Docker):
+
+```bash
+./gradlew test
+```
+
+Rodar a aplicação com MySQL/OpenAI reais, perfil `dev`:
 
 ```powershell
 $env:SPRING_PROFILES_ACTIVE="dev"
@@ -161,341 +428,141 @@ export OPENAI_API_KEY='sua-chave'
 
 Nenhum dos valores acima é real — substitua pelos seus.
 
-### Perfil de testes
-
-`./gradlew test` já ativa o perfil `test` (H2 em memória, chave fictícia, scheduler desligado) para toda a suíte — nenhuma variável de ambiente é necessária para rodar os testes. Nenhum teste conecta a MySQL, nenhum chama a OpenAI de verdade, nenhum usa Docker.
-
-### Perfil de produção
-
-Não existe um `application-prod.properties` versionado — apenas `application-prod.properties.example`, que documenta as propriedades esperadas mas **nunca é carregado automaticamente** (a extensão `.example` garante isso). Para rodar em produção: provisione `DB_URL`/`DB_USERNAME`/`DB_PASSWORD`/`OPENAI_API_KEY` como variáveis de ambiente reais (secret manager, variável de CI/CD etc. — fora do escopo aqui) e replique as propriedades desse arquivo onde sua aplicação realmente lê `application-prod.properties`. `EnvironmentConfigurationValidator` falha o startup com mensagem clara (`"A variável OPENAI_API_KEY é obrigatória..."`) se qualquer uma das quatro estiver ausente.
-
-### Segurança de segredos
-
-- **Nunca versione a chave da OpenAI** — se uma chave real já foi commitada em algum momento, revogue-a imediatamente na OpenAI e gere uma nova; reescrever o histórico do Git está fora do escopo desta tarefa.
-- `.env.example` é só documentação — não é carregado automaticamente pela aplicação.
-- H2 só existe no perfil de teste; MySQL nunca é usado nos testes.
-- `ddl-auto` não substitui migração versionada (o projeto ainda não usa Flyway/Liquibase) — `update` (dev) pode aplicar mudanças destrutivas silenciosamente; `validate` (prod) só detecta divergência, não corrige.
-- Swagger e métricas do Actuator ficam restritos em produção (ver matriz acima) — sem autenticação na frente do Actuator (fora do escopo desta tarefa), publicar métricas ou a documentação da API publicamente é uma exposição desnecessária.
-- Nenhuma API key real deve aparecer em testes — `VersionedSecretsTest` verifica estaticamente os arquivos de configuração/documentação versionados em busca do formato de uma chave OpenAI real (`sk-` + 20+ caracteres).
-
-## Documentação da API
-
-O projeto expõe documentação interativa via [springdoc-openapi](https://springdoc.org/) (OpenAPI 3 + Swagger UI).
-
-- Finalidade: visualizar e testar manualmente os três endpoints existentes (`POST /transactions`, `GET /transactions/{category}`, `POST /transactions/ai`) direto pelo navegador, sem precisar de um cliente HTTP externo.
-- Swagger UI: `http://localhost:8080/swagger-ui/index.html`
-- JSON OpenAPI: `http://localhost:8080/v3/api-docs`
-
-Para iniciar a aplicação (necessário para acessar o Swagger UI):
-
-```bash
-export OPENAI_API_KEY="your_api_key_here"
-./gradlew bootRun
-```
-
-Descrição resumida dos endpoints:
-
-- `POST /transactions` — cadastra uma transação a partir de um payload JSON (sem IA).
-- `GET /transactions/{category}` — lista transações de uma categoria (`GROCERIES`, `PHARMA`, `AUTO`).
-- `POST /transactions/ai` — recebe um áudio (`multipart/form-data`), transcreve, processa via ChatClient/Tool Calling e retorna a resposta como áudio MP3.
-
-**Atenção**:
-
-- O endpoint `/transactions/ai` exige a variável de ambiente `OPENAI_API_KEY` configurada no servidor.
-- Cada chamada a esse endpoint realiza chamadas reais à API da OpenAI (transcrição, chat e geração de voz) e **pode gerar custo**. Não dispare esse endpoint pelo Swagger UI apenas para "testar a interface".
-- Iniciar a aplicação (`bootRun`) sozinho **não** chama a OpenAI — as chamadas só ocorrem quando `/transactions/ai` é invocado.
-
-Exemplo de uso do Swagger UI:
-
-1. Acesse `http://localhost:8080/swagger-ui/index.html`.
-2. Expanda `POST /transactions`, clique em "Try it out" e envie o exemplo de payload já preenchido.
-3. Expanda `GET /transactions/{category}` e selecione uma categoria no seletor do enum.
-4. Para `POST /transactions/ai`, o Swagger UI exibe um seletor de arquivo — evite enviar um áudio real a menos que você aceite o custo de uma chamada real à OpenAI.
-
-## Upload de áudio
-
-`POST /transactions/ai` recebe o comando de voz como `multipart/form-data`, na parte obrigatória `file`.
-
-Antes de qualquer chamada à OpenAI (transcrição, ChatClient, geração de voz), o arquivo é validado localmente por `AudioFileValidator` (`dio.budgeting.infrastructure.http.audio`):
-
-1. arquivo presente e não vazio;
-2. tamanho dentro do limite (`app.audio.max-size`, padrão **10 MB**);
-3. `content type` presente;
-4. `content type` entre os aceitos: `audio/mpeg`, `audio/mp3`, `audio/mp4`, `audio/m4a`, `audio/x-m4a`, `audio/wav`, `audio/x-wav`, `audio/webm`.
-
-Um arquivo que falhe em qualquer uma dessas regras é rejeitado **sem gerar custo**: nenhuma chamada a `TranscriptionModel`, `ChatClient` ou `TextToSpeechModel` ocorre para um upload inválido.
-
-Exemplo de requisição válida (adaptar caminho do arquivo):
-
-```bash
-curl -X POST \
-  http://localhost:8080/transactions/ai \
-  -H "Content-Type: multipart/form-data" \
-  -F "file=@comando.mp3;type=audio/mpeg"
-```
-
-**Erros possíveis**:
-
-| Situação | Status | Título |
-| -------- | -----: | ------ |
-| Arquivo vazio, sem `content type` ou tipo não permitido | 400 | Arquivo de áudio inválido |
-| Parte `file` ausente | 400 | Arquivo obrigatório |
-| Requisição não multipart / multipart malformado | 400 | Requisição inválida |
-| Arquivo acima de 10 MB (validado localmente ou rejeitado pelo servidor) | 413 | Arquivo muito grande |
-
-**Atenção**: esta validação verifica apenas o `content type` declarado pelo cliente, não o conteúdo binário do arquivo — um arquivo renomeado (ex.: `.exe` enviado como `audio/mpeg`) não é detectado. Uploads que passam na validação ainda geram chamadas reais e potencialmente pagas à API da OpenAI.
-
-## Monetary Values
-
-- `amount` is represented as `BigDecimal`, in **reais**, always normalized to **two decimal places** (`RoundingMode.HALF_UP`), from the domain (`Transaction`) through persistence (`DECIMAL(19,2)`) and both REST/Tool Calling responses.
-- Example request: `{"description": "Combustível", "amount": 80.90, "category": "AUTO"}` → response: `{"id": "...", "category": "AUTO", "description": "Combustível", "amount": 80.90}`.
-- Values are rounded, not truncated, when they carry more than two decimal places (e.g. `80.905` becomes `80.91`); the Swagger schema documents `amount` as a decimal number.
-- **Local database note**: if a local MySQL instance was already running with the previous `BIGINT` column, the schema won't be auto-migrated safely by Hibernate (`ddl-auto=update` does not convert `BIGINT` to `DECIMAL`). Recreate the local dev database (or manually `ALTER TABLE`) before running against a pre-existing schema.
-
-## Validations
-
-Business invariants are enforced centrally in the domain (`Transaction`), so both REST and Tool Calling go through the same protection — the rules do not depend on controller/DTO annotations alone:
-
-- **Description**: required, cannot be null/empty/blank; leading and trailing spaces are stripped (`"  Combustível  "` is stored as `"Combustível"`).
-- **Amount**: required, must be greater than zero **after** normalization to two decimals (`HALF_UP`) — e.g. `0.004` rounds to `0.00` and is rejected, while `0.005` rounds to `0.01` and is accepted.
-- **Category**: required, restricted to the current enum values (`GROCERIES`, `PHARMA`, `AUTO`).
-
-Invalid input throws `InvalidTransactionException` (a domain exception, no HTTP concept involved) before any repository call. Bean Validation annotations (`@NotBlank`, `@NotNull`, `@DecimalMin`) were added to `TransactionRequest` as a first HTTP-level barrier, causing `POST /transactions` to reject invalid payloads with `400 Bad Request` — but this is a convenience layer, not the source of truth.
-
-Valid request example:
-```json
-{"description": "Combustível", "amount": 80.90, "category": "AUTO"}
-```
-Invalid request examples (all rejected):
-```json
-{"description": "", "amount": 80.90, "category": "AUTO"}
-{"description": "Combustível", "amount": 0.00, "category": "AUTO"}
-{"description": "Combustível", "amount": -10.00, "category": "AUTO"}
-```
-
-## Tratamento de erros
-
-Todos os endpoints REST retornam erros em um contrato único e previsível, baseado no padrão nativo do Spring (`ProblemDetail`, RFC 9457), implementado por um `@RestControllerAdvice` (`GlobalExceptionHandler`) na camada de infraestrutura HTTP. A exceção de domínio (`InvalidTransactionException`) não conhece HTTP: quem traduz negócio em status code é sempre o handler global.
-
-**Campos comuns**: `type`, `title`, `status`, `detail`, `instance` (caminho da requisição), `timestamp` (ISO 8601). A propriedade `errors` (lista de `{field, message}`) só aparece quando há falhas de validação de campo.
-
-### Erros de validação (Bean Validation)
-
-`POST /transactions` com payload inválido retorna todos os erros de campo, ordenados por nome do campo:
-
-```json
-{
-  "title": "Dados inválidos",
-  "status": 400,
-  "detail": "Um ou mais campos possuem valores inválidos.",
-  "instance": "/transactions",
-  "errors": [
-    {
-      "field": "amount",
-      "message": "O valor da transação deve ser maior que zero."
-    }
-  ]
-}
-```
-
-### Categoria inválida
-
-- No corpo (`POST /transactions`), quando `category` não corresponde a um valor do enum, ou na rota (`GET /transactions/{category}`), a resposta indica os valores aceitos, por exemplo: `"Categoria inválida. Valores aceitos: GROCERIES, PHARMA, AUTO."`.
-
-### JSON inválido
-
-- JSON malformado ou tipos incompatíveis (ex.: `amount` como texto) retornam `400` com título `Requisição inválida` e uma mensagem genérica e segura — sem nomes de classes internas, caminhos ou detalhes do Jackson.
-
-### Upload de áudio (`POST /transactions/ai`)
-
-- Parte `file` ausente retorna `400` com título `Arquivo obrigatório`.
-- Requisição não multipart ou malformada retorna `400` com título `Requisição inválida`.
-- Arquivo vazio, sem `content type` ou com tipo não permitido retorna `400` com título `Arquivo de áudio inválido` (ver [seção de upload de áudio](#upload-de-áudio) para a lista completa de regras).
-- Arquivo acima do tamanho máximo (validado localmente ou rejeitado pelo servidor via `MaxUploadSizeExceededException`) retorna `413` com título `Arquivo muito grande`.
-- Em todos os casos acima, nenhuma chamada a transcrição, ChatClient ou geração de voz ocorre.
-
-### Erro interno
-
-- Falhas inesperadas retornam `500` com título `Erro interno` e mensagem genérica; o erro completo é registrado no servidor via SLF4J, nunca exposto ao cliente. Stack traces e mensagens técnicas nunca aparecem no corpo da resposta.
-
-## Falhas da integração com IA
-
-`POST /transactions/ai` encadeia três chamadas externas — transcrição, `ChatClient` (com Tool Calling) e geração de voz — cada uma classificada e traduzida para um `ProblemDetail` padronizado pelo `GlobalExceptionHandler`, via `AiIntegrationException` lançada pelo `AiTransactionProcessor` (`dio.budgeting.infrastructure.ai`).
-
-| Etapa | Motivo | Status | Título |
-| --- | --- | -----: | --- |
-| Transcrição | áudio sem fala identificável (texto nulo/vazio) | 422 | Áudio não processável |
-| Qualquer etapa | timeout de conexão/leitura | 504 | Tempo limite excedido |
-| Qualquer etapa | limite de requisições do provedor (HTTP 429) | 503 | Serviço de IA temporariamente indisponível |
-| Qualquer etapa | provedor indisponível (HTTP 5xx, conexão recusada) | 503 | Serviço de IA temporariamente indisponível |
-| Chat / TTS | resposta vazia ou estruturalmente inválida do provedor | 502 | Resposta inválida do serviço de IA |
-| Qualquer etapa | falha externa não classificada | 502 | Falha na integração com IA |
-| Qualquer etapa | credencial/configuração inválida (HTTP 401/403) | 500 | Erro interno |
-
-Um HTTP 429 do provedor **nunca** vira `429` na resposta desta API — o limite é da conta/organização OpenAI, não da API local; é tratado como `503` com uma mensagem que sugere tentar novamente mais tarde.
-
-**Timeout**: `spring.http.clients.connect-timeout` (10s) / `spring.http.clients.read-timeout` (60s) em `application.properties`. É uma configuração **global única**, compartilhada pelos três modelos (`ChatModel`, `TranscriptionModel`, `TextToSpeechModel`) — o Spring AI injeta o mesmo `RestClient.Builder`/`HttpClientSettings` nos três, não havendo suporte nativo a um timeout diferente por modelo sem reescrever manualmente cada bean (fora de escopo desta tarefa).
-
-**Retry**: o Spring AI já retenta automaticamente (`spring-ai-retry`/`SpringAiRetryAutoConfiguration`) falhas transitórias (HTTP 5xx, timeout/conexão) via um `RetryTemplate` **compartilhado** pelos três modelos — inclusive o `ChatClient`. Isso não duplica Tool Calling: o retry atua apenas na chamada HTTP individual; a execução do `@Tool` (`persist-transaction`) é um método Java local, disparado uma única vez por `tool_call`, fora do laço de retry (verificado em `DefaultToolCallingManager`/`MethodToolCallback`). As tentativas foram reduzidas do default (10, backoff até 3 min — inviável para um endpoint síncrono) para `spring.ai.retry.max-attempts=2` (1 tentativa adicional) com backoff curto (`spring.ai.retry.backoff.*`). HTTP 4xx (401, 429 etc.) nunca é retentado automaticamente.
-
-**Tool Calling e domínio**: com a configuração padrão do Spring AI (`DefaultToolExecutionExceptionProcessor`, `alwaysThrow=false`), uma exceção de domínio lançada pelas tools (`InvalidTransactionException`) é convertida em texto e devolvida ao modelo como resultado da tool — nunca propaga como exceção Java através do `ChatClient`. Um comando de voz inválido (ex.: valor zero) vira uma resposta em áudio explicando o problema, não um erro de integração de IA.
-
-**Risco conhecido de duplicação**: se o Tool Calling já persistiu a transação e a geração de voz falhar **depois**, a API retorna um erro padronizado (502/503/504) mesmo com a transação já salva. Um cliente que reenvie o comando de voz após esse erro pode gerar uma transação duplicada. Esta tarefa não implementa idempotência — fica registrada como limitação para uma tarefa futura.
-
-**Testes**: `AiTransactionProcessorTest` (unitário, mocks de `TranscriptionModel`/`ChatClient`/`TextToSpeechModel`, sem chamada real) e `OpenAiFailureHandlingTest` (MockMvc, `AiTransactionProcessor` mockado como caixa-preta) cobrem toda a classificação acima. Nenhum teste usa API key real ou chama a OpenAI.
-
-## Idempotência do processamento por áudio
-
-`POST /transactions/ai` pode ser chamado mais de uma vez para o **mesmo comando de voz** (clique duplo, timeout percebido pelo cliente, queda de conexão, retry manual) — sem o header `Idempotency-Key`, cada reenvio repetiria transcrição, `ChatClient`/Tool Calling e a persistência da transação, podendo duplicá-la.
-
-**Uso**: envie um header `Idempotency-Key` (string opaca gerada pelo cliente, até 128 caracteres, apenas letras/números/`._:-`) com o mesmo valor para reenviar o *mesmo* comando:
-
-```bash
-curl -X POST \
-  http://localhost:8080/transactions/ai \
-  -H "Idempotency-Key: 3f18cfbe-6072-4e5c-b7a6-183ae1809846" \
-  -F "file=@comando.m4a;type=audio/mp4"
-```
-
-- **Header ausente** → `400` "Chave idempotente ausente".
-- **Formato inválido** (vazio, só espaços, acima de 128 caracteres, caracteres fora de `[A-Za-z0-9._:-]`) → `400` "Chave idempotente inválida".
-- **Mesma chave, mesmo arquivo, operação já concluída** → a resposta é reconstruída (novo TTS a partir do texto final já gerado) **sem** repetir transcrição, ChatClient ou Tool Calling. A resposta inclui o header `Idempotency-Replayed: true` (a primeira chamada retorna `false`).
-- **Mesma chave, arquivo diferente** → `409` "Chave idempotente em conflito" (a chave nunca é reaproveitada para um comando diferente).
-- **Mesma chave, operação ainda em processamento** (segunda requisição concorrente) → `409` "Operação em processamento".
-- **Mesma chave, falha anterior**: se a falha ocorreu na transcrição (nenhum efeito colateral possível ainda), a mesma chave pode ser reenviada normalmente. Se a falha ocorreu no chat ou na geração de voz (Tool Calling pode já ter persistido a transação), a chave fica bloqueada (`409` "Reprocessamento não permitido") — é necessário usar uma nova chave.
-
-**Concorrência**: a proteção real é uma constraint única de banco em `idempotency_key` (não uma checagem em memória). Duas requisições simultâneas com uma chave nova podem ambas passar pela checagem inicial; a constraint garante que só uma consegue persistir a operação, e a outra recebe "operação em processamento".
-
-**O que não é feito**: o áudio (enviado ou gerado) nunca é armazenado — apenas o texto final e seguro do ChatClient, usado para regenerar o áudio em um replay.
-
-**Risco residual**: se o Tool Calling já persistiu a transação e a geração de voz falhar depois, a operação é marcada como falha bloqueada para retry — a transação criada não é desfeita automaticamente (sem compensação nesta tarefa).
-
-### Expiração e limpeza (TASK-010)
-
-Chaves não são retidas para sempre: cada operação tem uma janela de retenção configurável, depois da qual o registro é removido e a chave pode ser reutilizada como se fosse uma operação nova.
-
-| Estado | Janela (padrão) | Ação após expiração |
-| ------ | ---------------- | -------------------- |
-| `COMPLETED` | 24h (`app.idempotency.completed-retention`) | Removida; a chave pode iniciar uma nova operação |
-| `FAILED` (qualquer estágio) | 24h (`app.idempotency.failed-retention`) | Removida; a chave pode iniciar uma nova operação |
-| `PROCESSING` | 15 min de inatividade (`app.idempotency.processing-timeout`) | Considerada abandonada e recuperada (nunca reprocessada automaticamente) |
-
-**Aviso importante**: a idempotência é garantida apenas durante a janela configurada. Após a expiração e remoção do registro, a mesma chave poderá ser tratada como uma nova operação — reenviar o mesmo comando de voz depois desse ponto pode gerar uma nova transação. Use uma chave nova por intenção de comando; nunca reutilize propositalmente uma chave antiga esperando bloqueio eterno.
-
-**Operações `PROCESSING` abandonadas** (ex.: a aplicação caiu no meio do processamento) são recuperadas com base no estágio alcançado, registrado em `currentStage` (`REGISTERED`/`TRANSCRIPTION`/`CHAT`/`SPEECH`, atualizado antes de cada chamada externa — transcrição, ChatClient/Tool Calling, geração de voz):
-
-- **`REGISTERED` ou `TRANSCRIPTION`** (Tool Calling ainda não rodou): a operação é marcada `FAILED`/`TRANSCRIPTION` e a **mesma chave permite retry** na próxima requisição, seguindo a política já existente.
-- **`CHAT` ou `SPEECH`** (Tool Calling pode já ter persistido uma transação): a operação é marcada `FAILED` no estágio correspondente e o **retry continua bloqueado** — nunca presumimos que nenhum efeito colateral ocorreu.
-- **Estágio desconhecido/nulo** (linha de um schema anterior a esta tarefa): tratado de forma conservadora como inseguro, igual a `CHAT`/`SPEECH`.
-
-Essa recuperação acontece de duas formas, sempre com a mesma política (`IdempotencyExpirationPolicy`), nunca duplicada:
-
-- **Oportunisticamente**, dentro do próprio `begin()` — uma operação abandonada há horas não espera a próxima execução do scheduler para ser resolvida.
-- **Periodicamente**, via `IdempotencyCleanupScheduler` (`@Scheduled`, intervalo `app.idempotency.cleanup-interval`), que primeiro recupera `PROCESSING` abandonadas e depois remove `COMPLETED`/`FAILED` expiradas, uma transação curta por linha (nunca mantém transação aberta durante qualquer chamada externa — não há chamada externa nesse fluxo).
-
-**Configuração** (`application.properties`, todos sob `app.idempotency.*`, tipados via `IdempotencyProperties`/`Duration`, validados na inicialização - duração zero ou negativa falha o startup):
-
-```properties
-app.idempotency.completed-retention=24h
-app.idempotency.failed-retention=24h
-app.idempotency.processing-timeout=15m
-app.idempotency.cleanup-interval=PT1H
-app.idempotency.cleanup-enabled=true
-app.idempotency.batch-size=100
-```
-
-`cleanup-interval` usa formato ISO-8601 (`PT1H`) propositalmente: além de ser lido como `Duration` tipado, o mesmo valor é lido cru por `@Scheduled(fixedDelayString = ...)`, que só entende ISO-8601 ou milissegundos — não os sufixos simples (`24h`) usados nas outras propriedades.
-
-No perfil de teste (`application-test.properties`), `app.idempotency.cleanup-enabled=false` desativa o bean do scheduler (`@ConditionalOnProperty`) para que nenhuma limpeza automática rode em paralelo com os testes; os testes chamam `IdempotencyCleanupService`/`IdempotencyCleanupScheduler` diretamente.
-
-**Relógio**: toda leitura de hora nesta área passa por um único `Clock` injetável (`Clock.systemUTC()` em produção), nunca `OffsetDateTime.now()` espalhado pelo código — o que permite testes determinísticos com `Clock.fixed` sem `Thread.sleep`.
-
-**Concorrência entre scheduler e requisição**: cada linha usa `@Version` (lock otimista já existente). Se o scheduler tentar recuperar uma linha que a própria requisição acabou de concluir/falhar, o conflito gera `OptimisticLockingFailureException`, que o scheduler apenas registra e ignora — a linha é reavaliada na próxima execução, nunca derruba o lote inteiro.
-
-**Concorrência entre limpeza e replay**: a exclusão em lote revalida `status`+`updatedAt` na própria cláusula `WHERE` no momento do delete, então uma linha que mudou de estado entre a consulta e a exclusão (ex.: um retry que voltou `FAILED` → `PROCESSING`) nunca é removida por engano. Um replay em andamento não é afetado: o texto necessário (`responseText`) já é lido antes de qualquer exclusão.
-
-**Índices**: `(status, updated_at)` suporta as consultas de expiração/abandono sem varrer a tabela inteira; a constraint única em `idempotency_key` permanece a proteção real contra duplicação.
-
-## Observabilidade
-
-Correlação, logs estruturados e métricas técnicas para o fluxo de IA (TASK-011) — puramente aditivo: nada aqui influencia o resultado de uma requisição, só mede e registra em cima do que já acontece.
-
-**Correlação por requisição**: envie (opcionalmente) um header `X-Correlation-ID` — se for seguro (até 64 caracteres, apenas letras/números/`._-`, sem espaços/controle) ele é reaproveitado; caso contrário (ausente, vazio, longo demais ou com caracteres inseguros) um novo UUID é gerado silenciosamente, sem rejeitar a requisição. O valor resolvido é devolvido no mesmo header da resposta — em sucesso e em erro — e fica disponível no MDC (`correlationId`) durante toda a requisição, aparecendo em cada linha de log (`CorrelationIdFilter`, um `OncePerRequestFilter`). O MDC é sempre limpo no `finally`, mesmo se a cadeia lançar exceção.
-
-```bash
-curl -X POST \
-  http://localhost:8080/transactions/ai \
-  -H "X-Correlation-ID: teste-local-001" \
-  -H "Idempotency-Key: comando-001" \
-  -F "file=@comando.m4a"
-```
-
-**Componente central**: `AiObservability` é o único ponto de contato com o Micrometer (`MeterRegistry`) no módulo — nenhuma outra classe chama `Counter`/`Timer` diretamente, todas chamam métodos semânticos (`recordUploadRejection`, `recordIdempotencyReplay` etc.).
-
-**Métricas**:
-
-| Métrica | Tipo | Tags | Finalidade |
-| ------- | ---- | ---- | ---------- |
-| `budgeting.ai.requests` | Timer | `result=success\|failure`, `replayed=true\|false` | Duração total do endpoint (inclui replay, quando só a TTS roda) |
-| `budgeting.ai.stage.duration` | Timer | `stage=transcription\|chat\|speech`, `result=success\|failure` | Duração de cada etapa da IA (inclui retries nativos do `spring-ai-retry`) |
-| `budgeting.ai.failures` | Counter | `stage`, `reason` (enum `AiIntegrationException.Reason`, minúsculo) | Falhas por etapa e motivo classificado |
-| `budgeting.ai.upload.rejections` | Counter | `reason=empty\|missing_content_type\|unsupported_type\|too_large\|missing_part\|malformed_multipart` | Arquivos rejeitados antes de qualquer chamada à OpenAI |
-| `budgeting.ai.idempotency.operations` | Counter | `outcome=new` | Operações iniciadas (novas ou reiniciadas para retry) |
-| `budgeting.ai.idempotency.replays` | Counter | (nenhuma) | Replays idempotentes |
-| `budgeting.ai.idempotency.conflicts` | Counter | `reason` (enum `IdempotencyException.Reason`, minúsculo) | Conflitos: payload diferente, em processamento, retry bloqueado |
-| `budgeting.idempotency.cleanup` | Counter | `action=recovered\|deleted\|run`, `result=success\|failure` | Operações recuperadas/removidas pelo scheduler, e falhas inesperadas do lote |
-
-**Cardinalidade**: toda tag vem de um enum ou literal fixo já usado para status HTTP (`Stage`, `Reason`, `AudioCommandStatus`-like outcomes). Nunca aparecem como tag: `correlationId`, `Idempotency-Key`, fingerprint, nome de arquivo, mensagem de exceção, URI ou qualquer valor variável — o que manteria a métrica de baixa cardinalidade indefinidamente alta.
-
-**Duração**: total (`budgeting.ai.requests`) cobre da entrada no endpoint até a resposta final (sucesso ou falha); por etapa (`budgeting.ai.stage.duration`) cobre exatamente a chamada lógica ao `TranscriptionModel`/`ChatClient`/`TextToSpeechModel` feita por `AiTransactionProcessor`, incluindo qualquer retry automático do `spring-ai-retry` (não medido tentativa a tentativa nesta tarefa).
-
-**Idempotência**: `AudioCommandIdempotencyService.begin(...)` registra o resultado uma única vez, no ponto de entrada público — nunca nos métodos privados internos — então uma recuperação oportunista que cai em `resolveFailed` não é contada duas vezes. `MISSING_KEY`/`INVALID_KEY` (erro de validação, não de idempotência) não entram na métrica de conflitos.
-
-**Upload**: `AudioFileValidator` conta suas quatro razões (`empty`, `missing_content_type`, `unsupported_type`, `too_large`); `GlobalExceptionHandler` conta as duas que nunca chegam ao validator (`missing_part`, `malformed_multipart`, mais `too_large` quando o limite do Spring MVC barra antes do validator) — nenhuma razão é contada duas vezes.
-
-**Scheduler**: `IdempotencyCleanupScheduler` registra `recovered`/`deleted` a cada execução (só quando > 0) e uma falha agregada se o lote inteiro lançar uma exceção inesperada (conflitos de `@Version` por linha já são absorvidos dentro de `IdempotencyCleanupService` e não contam como falha do lote).
-
-**Actuator**: adicionado (`spring-boot-starter-actuator`) apenas para expor `MeterRegistry` e os dois endpoints úteis:
-
-```properties
-management.endpoints.web.exposure.include=health,metrics
-management.endpoint.health.show-details=never
-```
-
-`/actuator/env`, `/actuator/beans`, `/actuator/configprops`, `/actuator/heapdump` e qualquer outro endpoint **não** exposto retornam `404` (nunca `*` na configuração).
-
-**Segurança dos logs**: nenhum log ou tag registra áudio, bytes do arquivo, transcrição, prompt, resposta completa da IA, `Idempotency-Key`, fingerprint, API key ou dados financeiros. A exceção original (com stack trace) é logada uma única vez, na camada que primeiro a classifica (`AiTransactionProcessor.classify`, ou o handler correspondente do `GlobalExceptionHandler` para falhas fora da integração de IA) — nunca reemitida em `AiObservability`, que só loga evento/etapa/motivo. O correlation ID em si é um token técnico opaco, nunca a chave de idempotência.
-
-## Testes automatizados
-
-O projeto combina três níveis de teste, cada um cobrindo uma responsabilidade diferente:
-
-- **Testes unitários** (`TransactionValidationTest`, `PersistTransactionUseCaseTest`, `MonetaryAmountBigDecimalTest`, `AudioFileValidatorTest`, `GlobalExceptionHandlerTest`) — validam regras de domínio, casos de uso e o handler de erros isoladamente, com mocks, sem subir o contexto Spring inteiro (ou subindo-o com `TransactionRepository`/beans de IA mockados).
-- **Testes HTTP com contrato mockado** (`TransactionControllerValidationTest`, `TransactionAudioUploadTest`, `SwaggerDocumentationTest`) — usam `MockMvc` contra o `TransactionController` real, mas com `TransactionRepository` mockado (`@MockitoBean`) e a autoconfiguração de JPA/DataSource excluída; comprovam o contrato HTTP (validação, status, `ProblemDetail`, documentação OpenAPI) sem tocar em persistência.
-- **Testes de integração REST** (`TransactionRestIntegrationTest`) — percorrem o fluxo completo e real: `MockMvc` → `TransactionController` → `PersistTransactionUseCase`/`ListTransactionsByCategoryUseCase` → `JpaTransactionRepository` → `TransactionEntityRepository` (Spring Data JPA) → banco H2 em memória, com resposta HTTP serializada de volta. Nenhum componente de negócio é mockado aqui; apenas o banco é isolado.
-- **Testes de resiliência da integração com IA** (`AiTransactionProcessorTest`, `OpenAiFailureHandlingTest`) — cobrem a classificação de falhas de transcrição/chat/voz e o mapeamento para `ProblemDetail` (ver [seção de falhas da integração com IA](#falhas-da-integração-com-ia)). Sem chamada real à OpenAI.
-- **Testes de idempotência** (`AudioPayloadFingerprintTest`, `AudioCommandIdempotencyServiceTest`, `TransactionAudioIdempotencyTest`) — cobrem validação da chave, fingerprint SHA-256, replay/conflito/em-processamento/política de retry e a constraint única no H2 (ver [seção de idempotência](#idempotência-do-processamento-por-áudio)). Sem chamada real à OpenAI.
-- **Testes de expiração e limpeza** (`IdempotencyPropertiesTest`, `IdempotencyExpirationPolicyTest`, `IdempotencyCleanupServiceTest`, `IdempotencyCleanupSchedulerTest`, mais os cenários de recuperação/expiração/lock otimista adicionados a `AudioCommandIdempotencyServiceTest`) — cobrem validação de propriedades, limites de janela com `Clock.fixed`, recuperação de `PROCESSING` abandonada por estágio, remoção em lote com H2 real e conflito de `@Version` (ver [seção de expiração e limpeza](#expiração-e-limpeza-task-010)). Scheduler nunca roda automaticamente nos testes; sem chamada real à OpenAI.
-- **Testes de observabilidade** (`CorrelationIdFilterTest`, `AiObservabilityTest`, `AiMetricsIntegrationTest`, `ActuatorEndpointsTest`, mais métricas adicionadas a `AiTransactionProcessorTest`, `AudioFileValidatorTest` e `IdempotencyCleanupSchedulerTest`) — cobrem o filtro de correlação (header, MDC, limpeza, caminho de erro), o contrato de tags/nomes de métrica com `SimpleMeterRegistry`, o fluxo `POST /transactions/ai` de ponta a ponta com `MeterRegistry` real do contexto, e a exposição controlada do Actuator (ver [seção de observabilidade](#observabilidade)). Sem chamada real à OpenAI.
-- **Testes de configuração por ambiente** (`EnvironmentConfigurationTest`, `ProductionProfileSecurityTest`, `VersionedSecretsTest`) — cobrem `EnvironmentConfigurationValidator` (`ApplicationContextRunner`, sem conexão real) para `dev`/`prod`/padrão/`test`, a postura restrita de produção (Actuator só `health`, Swagger desabilitado, `ddl-auto=validate`) sem carregar um perfil `prod` real, e uma verificação estática dos arquivos de configuração/documentação versionados em busca de segredos reais (ver [seção de configuração por ambiente](#configuração-por-ambiente)). Sem MySQL, sem Docker, sem chamada real à OpenAI.
-
-**Banco de teste**: os testes de integração usam H2 em memória (`com.h2database:h2`, dependência apenas em `testRuntimeOnly`), configurado no perfil `test` (`src/test/resources/application-test.properties`, modo de compatibilidade MySQL, schema recriado via `ddl-auto=create-drop`). Não depende de MySQL local nem de Docker. Cada teste roda dentro de uma transação com rollback automático (`@Transactional`), garantindo isolamento sem necessidade de limpeza manual.
-
-**Sem chamadas à OpenAI**: os beans de IA (`ChatClient`, `TranscriptionModel`, `TextToSpeechModel`) sobem normalmente no contexto de teste com uma API key fictícia (`spring.ai.openai.api-key=test-key-not-a-real-credential`) — a simples construção desses beans não dispara chamada de rede. O endpoint `POST /transactions/ai` não é testado de ponta a ponta nesta suíte; apenas um teste de sanidade confirma que a rota existe e retorna `400` antes de qualquer chamada externa.
-
-Executar apenas a suíte de integração:
+**Windows**: o caminho deste repositório contém `&`, o que quebra o tratamento interno de argumentos do `gradlew.bat`. Se `.\gradlew.bat ...` falhar com um erro de "comando não reconhecido", invoque o wrapper diretamente:
 
 ```powershell
-.\gradlew.bat test --tests "dio.budgeting.TransactionRestIntegrationTest"
+java -jar gradle\wrapper\gradle-wrapper.jar test
+java -jar gradle\wrapper\gradle-wrapper.jar bootRun
 ```
 
-Executar todos os testes do módulo:
+**Via Docker Compose** (mais simples, sem precisar de `SPRING_PROFILES_ACTIVE`): o `spring-boot-docker-compose` detecta `compose.yml` e conecta automaticamente ao MySQL do container. Basta configurar `OPENAI_API_KEY` e rodar `./gradlew bootRun` — nenhuma outra variável é necessária (não ative `dev` nesse caso, ver [Banco de dados](#banco-de-dados) sobre a divergência de porta/nome do banco).
+
+## Swagger e Actuator
+
+| URL | Descrição | Disponível em |
+| --- | --------- | -------------- |
+| `/swagger-ui/index.html` | Swagger UI (documentação interativa) | `dev`, `test`, comum — **desabilitado no exemplo de produção** |
+| `/v3/api-docs` | JSON OpenAPI | mesma disponibilidade acima |
+| `/actuator/health` | Status da aplicação (sem detalhes) | Sempre |
+| `/actuator/metrics` | Métricas Micrometer | `dev`, `test`, comum — **desabilitado no exemplo de produção** |
+
+Iniciar a aplicação sozinha **não** chama a OpenAI — as chamadas só ocorrem quando `/transactions/ai` é invocado. Cada chamada a esse endpoint realiza 3 chamadas reais e potencialmente pagas à API da OpenAI; não dispare pelo Swagger UI apenas para "testar a interface".
+
+## Testes automatizados
 
 ```powershell
 .\gradlew.bat test
 ```
 
-## Notes
+Alternativa (ver nota sobre o `&` no caminho, acima):
 
-- Educational final project focused on AI plus architectural discipline.
-- External provider integration tests may require active credentials.
+```powershell
+java -jar gradle\wrapper\gradle-wrapper.jar test
+```
+
+**Resultado atual** (última execução completa, TASK-013):
+
+```text
+292 testes executados
+0 falhas
+0 erros
+5 pulados
+```
+
+Este número reflete a contagem de testes executados nesta versão do projeto, **não uma métrica de cobertura de código**.
+
+Categorias: unitários (domínio, casos de uso, validadores), MVC com contrato mockado, integração real com JPA/H2, configuração por ambiente, segurança de configuração, métricas (`SimpleMeterRegistry`), idempotência e concorrência (lock otimista), e 5 classes externas puladas por padrão.
+
+### Testes externos (`*IT`)
+
+As 5 classes `OpenAiChatClientIT`, `OpenAiChatModelIT`, `OpenAiSpeechModelIT`, `OpenAiTranscriptionModelIT` e `ToolCallingIT` fazem chamadas **reais** à API da OpenAI. Todas são condicionadas por `@EnabledIfEnvironmentVariable(named = "OPENAI_API_KEY", matches = ".+")` — sem a variável definida, a classe inteira é pulada antes de qualquer teste rodar, então `./gradlew test` nunca as dispara acidentalmente. Só execute-as manualmente, com uma chave real seguramente configurada no seu ambiente (nunca em CI sem um cofre de segredos), ciente de que cada execução gera custo real.
+
+## Estrutura do projeto
+
+```text
+src/main/java/dio/budgeting
+├── application
+│   ├── PersistTransactionUseCase.java
+│   ├── ListTransactionsByCategoryUseCase.java
+│   ├── input/
+│   └── output/
+├── domain
+│   ├── Transaction.java
+│   ├── Category.java
+│   ├── TransactionId.java
+│   └── TransactionRepository.java
+└── infrastructure
+    ├── ai/              # AiTransactionProcessor, classificação de falhas
+    ├── config/          # OpenApiConfig, EnvironmentConfigurationValidator
+    ├── http/            # TransactionController, CorrelationIdFilter, GlobalExceptionHandler
+    │   └── audio/       # AudioFileValidator
+    ├── idempotency/      # AudioCommandIdempotencyService, expiração, scheduler
+    ├── observability/    # AiObservability (Micrometer)
+    └── persistence/      # adaptadores JPA
+```
+
+## Decisões técnicas
+
+- **`BigDecimal` para dinheiro**: nunca `double`/`float`, evitando erro de arredondamento binário em valores financeiros.
+- **`ProblemDetail` (RFC 9457)** como contrato único de erro: padrão nativo do Spring, evita formatos ad hoc por endpoint.
+- **Idempotência por chave opaca do cliente** (não gerada pelo servidor): o cliente decide o que conta como "o mesmo comando", igual ao padrão usado por APIs de pagamento.
+- **SHA-256 do payload como complemento à chave**, não substituto: detecta reuso indevido da mesma chave para um comando diferente.
+- **Replay via TTS apenas**: reconstruir só o áudio a partir do texto já gerado evita repetir Tool Calling (e uma possível persistência duplicada) sem precisar guardar o áudio original.
+- **Transações JPA curtas**: nenhuma chamada à OpenAI acontece dentro de uma transação de banco — as chamadas de rede (potencialmente lentas) ficam sempre fora do escopo transacional.
+- **Sem retry adicional no `ChatClient`**: o retry nativo do Spring AI já cobre falhas transitórias na camada HTTP; um retry customizado arriscaria duplicar Tool Calling.
+- **Sem circuit breaker**: escopo educacional — o retry limitado e a classificação de erros já cobrem o cenário mais comum (falha transitória do provedor).
+- **Sem tabela extra de auditoria**: logs estruturados + métricas + o próprio registro de idempotência já dão visibilidade suficiente para os objetivos desta trilha.
+- **`Clock` injetável** em vez de `Instant.now()`/`OffsetDateTime.now()` espalhado: permite testes determinísticos de expiração sem `Thread.sleep`.
+- **Actuator restrito por padrão**: sem autenticação em frente ao Actuator, expor o mínimo necessário (`health`, e `metrics` fora de produção) é a postura mais segura disponível sem introduzir um pacote de segurança completo.
+- **Configuração por perfis explícitos** (`dev`/`test`/`prod`), nunca um perfil ativo hardcoded: cada ambiente falha de forma previsível em vez de herdar silenciosamente um default de outro.
+
+## Limitações
+
+- **Sem autenticação/autorização** — qualquer cliente com acesso à rede pode chamar os endpoints.
+- **Sem Flyway/Liquibase** — sem migração de schema versionada; `ddl-auto` não substitui isso.
+- **Sem Redis, fila/mensageria ou tracing distribuído** — observabilidade é local ao processo.
+- **Scheduler de limpeza sem coordenação distribuída** — assume uma única instância da aplicação; múltiplas instâncias poderiam competir (o lock otimista evita corrupção, mas não coordena o trabalho).
+- **H2 em modo MySQL não é equivalente total ao MySQL real** — diferenças sutis de tipo/função podem existir.
+- **Spring AI em milestone pré-release (`2.0.0-M4`)** — API pode mudar em versões futuras.
+- **Sem proteção completa contra prompt injection** na transcrição — risco inerente a qualquer integração de tool-calling com LLM, não mitigável com regex simples.
+- **Sem deduplicação de tool-call dentro de um mesmo turno de chat** — a idempotência protege contra reenvio de requisição HTTP, não contra o modelo alucinar e chamar a mesma tool duas vezes numa única resposta.
+- **Idempotência limitada à janela de retenção configurada** — após expiração e remoção do registro, a mesma chave pode iniciar uma nova operação.
+- **Sem deploy real documentado** — este README cobre execução local; não há pipeline de CI/CD nem containerização de produção.
+
+## Melhorias futuras
+
+Sugestões para uma eventual próxima versão (não são pendências bloqueantes desta entrega):
+
+- Autenticação e autorização (ex.: Spring Security + OAuth2/JWT).
+- Migração de schema versionada (Flyway ou Liquibase).
+- Testcontainers para testes de integração contra um MySQL real.
+- Cache distribuído (Redis) e/ou mensageria para desacoplar processamento.
+- Tracing distribuído (OpenTelemetry) complementando as métricas locais atuais.
+- Scanner de vulnerabilidades de dependências integrado ao build.
+- Pipeline de CI/CD e containerização documentada para deploy.
+- Deduplicação de chamadas de tool repetidas dentro de um mesmo turno de chat.
+- Frontend web para o fluxo de comando de voz.
+
+## Contexto educacional
+
+Este módulo nasceu como parte da trilha [DIO Spring Boot Learning Track](../README.md) e foi expandido, ao longo de 14 tarefas, bem além do escopo do desafio original — o foco em todas elas foi **aprendizado de arquitetura, Spring AI e práticas de engenharia** (idempotência, resiliência, observabilidade, segurança de configuração, auditoria), não a entrega de um produto financeiro pronto para produção. As decisões documentadas acima refletem esse escopo educacional; onde uma solução mais simples e didática foi preferida a uma solução "de produção" mais complexa, isso está registrado explicitamente nas seções de [Decisões técnicas](#decisões-técnicas) e [Limitações](#limitações).
+
+## Referências de arquitetura compartilhada
+
+Conceitos de arquitetura comuns a toda a trilha estão documentados no README raiz:
+
+- [Camadas DDD](../README.md#ddd-layered-architecture)
+- [Class vs record](../README.md#java-class-vs-java-record-in-domain-modeling)
+- [Identificadores fortemente tipados](../README.md#strong-typed-identifiers)
+- [Padrão Repository](../README.md#repository-pattern)
+- [Use cases e Clean Architecture](../README.md#use-cases-and-clean-architecture)
+- [Suporte a Docker Compose em desenvolvimento](../README.md#docker-compose-support-in-development)
+
+Documentação do Spring AI usada como referência:
+
+- [Spring AI Reference](https://docs.spring.io/spring-ai/reference/index.html)
+- [ChatModel API](https://docs.spring.io/spring-ai/reference/api/chatmodel.html)
+- [ChatClient API](https://docs.spring.io/spring-ai/reference/api/chatclient.html)
+- [Tools API](https://docs.spring.io/spring-ai/reference/api/tools.html)
+- [Audio Transcriptions API](https://docs.spring.io/spring-ai/reference/api/audio/transcriptions.html)
+- [Audio Speech API](https://docs.spring.io/spring-ai/reference/api/audio/speech.html)
