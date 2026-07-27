@@ -2,6 +2,8 @@ package dio.budgeting;
 
 import dio.budgeting.infrastructure.idempotency.IdempotencyCleanupScheduler;
 import dio.budgeting.infrastructure.idempotency.IdempotencyCleanupService;
+import dio.budgeting.infrastructure.observability.AiObservability;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.NoSuchBeanDefinitionException;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -42,7 +44,7 @@ class IdempotencyCleanupSchedulerTest {
         var cleanupService = mock(IdempotencyCleanupService.class);
         when(cleanupService.recoverAbandonedProcessing()).thenReturn(3);
         when(cleanupService.cleanupExpired()).thenReturn(25);
-        var scheduler = new IdempotencyCleanupScheduler(cleanupService);
+        var scheduler = new IdempotencyCleanupScheduler(cleanupService, new AiObservability(new SimpleMeterRegistry()));
 
         scheduler.run();
 
@@ -56,10 +58,61 @@ class IdempotencyCleanupSchedulerTest {
         var cleanupService = mock(IdempotencyCleanupService.class);
         when(cleanupService.recoverAbandonedProcessing()).thenReturn(0);
         when(cleanupService.cleanupExpired()).thenReturn(0);
-        var scheduler = new IdempotencyCleanupScheduler(cleanupService);
+        var scheduler = new IdempotencyCleanupScheduler(cleanupService, new AiObservability(new SimpleMeterRegistry()));
 
         scheduler.run();
 
         assertThat(true).isTrue(); // reaching here means no exception was thrown
+    }
+
+    // --- TASK-011: cleanup metrics ---
+
+    @Test
+    void run_recordsRecoveredAndDeletedCounters_noIdsOrKeys() {
+        var cleanupService = mock(IdempotencyCleanupService.class);
+        when(cleanupService.recoverAbandonedProcessing()).thenReturn(3);
+        when(cleanupService.cleanupExpired()).thenReturn(25);
+        var meterRegistry = new SimpleMeterRegistry();
+        var scheduler = new IdempotencyCleanupScheduler(cleanupService, new AiObservability(meterRegistry));
+
+        scheduler.run();
+
+        var recovered = meterRegistry.find("budgeting.idempotency.cleanup")
+                .tag("action", "recovered").tag("result", "success").counter();
+        var deleted = meterRegistry.find("budgeting.idempotency.cleanup")
+                .tag("action", "deleted").tag("result", "success").counter();
+        assertThat(recovered).isNotNull();
+        assertThat(recovered.count()).isEqualTo(3.0);
+        assertThat(deleted).isNotNull();
+        assertThat(deleted.count()).isEqualTo(25.0);
+        assertThat(recovered.getId().getTags()).hasSize(2);
+    }
+
+    @Test
+    void run_withNothingToDo_recordsNoCounterIncrement() {
+        var cleanupService = mock(IdempotencyCleanupService.class);
+        when(cleanupService.recoverAbandonedProcessing()).thenReturn(0);
+        when(cleanupService.cleanupExpired()).thenReturn(0);
+        var meterRegistry = new SimpleMeterRegistry();
+        var scheduler = new IdempotencyCleanupScheduler(cleanupService, new AiObservability(meterRegistry));
+
+        scheduler.run();
+
+        assertThat(meterRegistry.find("budgeting.idempotency.cleanup").counters()).isEmpty();
+    }
+
+    @Test
+    void run_whenBatchThrows_recordsFailureCounter_andNeverPropagates() {
+        var cleanupService = mock(IdempotencyCleanupService.class);
+        when(cleanupService.recoverAbandonedProcessing()).thenThrow(new RuntimeException("db unavailable"));
+        var meterRegistry = new SimpleMeterRegistry();
+        var scheduler = new IdempotencyCleanupScheduler(cleanupService, new AiObservability(meterRegistry));
+
+        scheduler.run();
+
+        var failure = meterRegistry.find("budgeting.idempotency.cleanup")
+                .tag("action", "run").tag("result", "failure").counter();
+        assertThat(failure).isNotNull();
+        assertThat(failure.count()).isEqualTo(1.0);
     }
 }

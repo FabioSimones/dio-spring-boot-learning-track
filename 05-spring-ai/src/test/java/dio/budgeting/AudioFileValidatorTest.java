@@ -2,12 +2,15 @@ package dio.budgeting;
 
 import dio.budgeting.infrastructure.http.audio.AudioFileValidator;
 import dio.budgeting.infrastructure.http.audio.InvalidAudioFileException;
+import dio.budgeting.infrastructure.observability.AiObservability;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.web.multipart.MultipartFile;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
@@ -22,7 +25,8 @@ class AudioFileValidatorTest {
 
     private static final long TEN_MB = 10L * 1024 * 1024;
 
-    private final AudioFileValidator validator = new AudioFileValidator("10MB");
+    private final SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+    private final AudioFileValidator validator = new AudioFileValidator("10MB", new AiObservability(meterRegistry));
 
     // --- Valid ---
 
@@ -120,5 +124,52 @@ class AudioFileValidatorTest {
                 .hasMessage("O arquivo de áudio excede o tamanho máximo permitido.")
                 .extracting(ex -> ((InvalidAudioFileException) ex).getReason())
                 .isEqualTo(InvalidAudioFileException.Reason.TOO_LARGE);
+    }
+
+    // --- TASK-011: each rejection is counted exactly once, tagged only with the reason ---
+
+    @Test
+    void rejectsEmptyFile_recordsRejectionMetric_withoutFilenameOrContentTypeTag() {
+        var file = new MockMultipartFile("file", "audio.mp3", "audio/mpeg", new byte[0]);
+
+        assertThatThrownBy(() -> validator.validate(file)).isInstanceOf(InvalidAudioFileException.class);
+
+        var counter = meterRegistry.find("budgeting.ai.upload.rejections").tag("reason", "empty").counter();
+        assertThat(counter).isNotNull();
+        assertThat(counter.count()).isEqualTo(1.0);
+        assertThat(counter.getId().getTags()).hasSize(1);
+    }
+
+    @Test
+    void rejectsDisallowedContentType_recordsUnsupportedTypeRejectionMetric() {
+        var file = new MockMultipartFile("file", "audio.mp3", "text/plain", new byte[]{1, 2, 3});
+
+        assertThatThrownBy(() -> validator.validate(file)).isInstanceOf(InvalidAudioFileException.class);
+
+        var counter = meterRegistry.find("budgeting.ai.upload.rejections").tag("reason", "unsupported_type").counter();
+        assertThat(counter).isNotNull();
+        assertThat(counter.count()).isEqualTo(1.0);
+    }
+
+    @Test
+    void rejectsFile_aboveSizeLimit_recordsTooLargeRejectionMetric() {
+        var file = mock(MultipartFile.class);
+        when(file.isEmpty()).thenReturn(false);
+        when(file.getSize()).thenReturn(TEN_MB + 1);
+
+        assertThatThrownBy(() -> validator.validate(file)).isInstanceOf(InvalidAudioFileException.class);
+
+        var counter = meterRegistry.find("budgeting.ai.upload.rejections").tag("reason", "too_large").counter();
+        assertThat(counter).isNotNull();
+        assertThat(counter.count()).isEqualTo(1.0);
+    }
+
+    @Test
+    void acceptedFile_neverRecordsRejectionMetric() {
+        var file = new MockMultipartFile("file", "audio.mp3", "audio/mpeg", new byte[]{1, 2, 3});
+
+        validator.validate(file);
+
+        assertThat(meterRegistry.find("budgeting.ai.upload.rejections").counters()).isEmpty();
     }
 }

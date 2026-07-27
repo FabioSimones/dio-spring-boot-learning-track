@@ -12,6 +12,7 @@ import dio.budgeting.infrastructure.http.response.TransactionResponse;
 import dio.budgeting.infrastructure.idempotency.AudioCommandIdempotencyService;
 import dio.budgeting.infrastructure.idempotency.AudioPayloadFingerprint;
 import dio.budgeting.infrastructure.idempotency.IdempotencyDecision;
+import dio.budgeting.infrastructure.observability.AiObservability;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.media.Content;
@@ -40,17 +41,20 @@ public class TransactionController {
     private final AudioFileValidator audioFileValidator;
     private final AiTransactionProcessor aiTransactionProcessor;
     private final AudioCommandIdempotencyService idempotencyService;
+    private final AiObservability observability;
 
     public TransactionController(PersistTransactionUseCase persistTransactionUseCase,
                                  ListTransactionsByCategoryUseCase listTransactionsByCategoryUseCase,
                                  AudioFileValidator audioFileValidator,
                                  AiTransactionProcessor aiTransactionProcessor,
-                                 AudioCommandIdempotencyService idempotencyService) {
+                                 AudioCommandIdempotencyService idempotencyService,
+                                 AiObservability observability) {
         this.persistTransactionUseCase = persistTransactionUseCase;
         this.listTransactionsByCategoryUseCase = listTransactionsByCategoryUseCase;
         this.audioFileValidator = audioFileValidator;
         this.aiTransactionProcessor = aiTransactionProcessor;
         this.idempotencyService = idempotencyService;
+        this.observability = observability;
     }
 
     @Operation(
@@ -182,7 +186,13 @@ public class TransactionController {
                     em processamento como abandonada). Após a janela, o registro é removido automaticamente e a \
                     mesma chave pode voltar a ser aceita como se fosse uma operação nova - reenviar o mesmo comando \
                     depois de expirado pode gerar uma nova transação. Use uma chave nova por intenção de comando; \
-                    nunca reutilize propositalmente uma chave antiga."""
+                    nunca reutilize propositalmente uma chave antiga.
+
+                    Todo o fluxo é observável: envie (opcionalmente) o header X-Correlation-ID para acompanhar esta \
+                    requisição nos logs do servidor - ele é sempre devolvido no mesmo header da resposta, inclusive \
+                    em respostas de erro. Duração total e por etapa, replays e conflitos de idempotência são \
+                    medidos internamente; nenhum dado do comando (áudio, transcrição, prompt ou chave) é exposto \
+                    nessas métricas."""
     )
     @ApiResponses({
             @ApiResponse(
@@ -369,38 +379,48 @@ public class TransactionController {
                     content = @Content(mediaType = MediaType.MULTIPART_FORM_DATA_VALUE)
             )
             @RequestParam("file") MultipartFile file) throws IOException {
-        audioFileValidator.validate(file);
+        var totalSample = observability.startTotal();
+        boolean success = false;
+        boolean replayed = false;
+        try {
+            audioFileValidator.validate(file);
 
-        byte[] audioBytes = file.getBytes();
-        String fingerprint = AudioPayloadFingerprint.of(audioBytes);
-        var decision = idempotencyService.begin(idempotencyKey, fingerprint);
+            byte[] audioBytes = file.getBytes();
+            String fingerprint = AudioPayloadFingerprint.of(audioBytes);
+            var decision = idempotencyService.begin(idempotencyKey, fingerprint);
 
-        byte[] responseAudio;
-        boolean replayed = decision instanceof IdempotencyDecision.Replay;
-        if (decision instanceof IdempotencyDecision.Replay replay) {
-            responseAudio = aiTransactionProcessor.regenerateAudio(replay.responseText());
-        } else {
-            var start = (IdempotencyDecision.Start) decision;
-            try {
-                var result = aiTransactionProcessor.process(new ByteArrayResource(audioBytes),
-                        stage -> idempotencyService.markStage(start.operationId(), stage));
-                idempotencyService.complete(start.operationId(), result.responseText(), result.transactionId());
-                responseAudio = result.audio();
+            byte[] responseAudio;
+            replayed = decision instanceof IdempotencyDecision.Replay;
+            if (decision instanceof IdempotencyDecision.Replay replay) {
+                responseAudio = aiTransactionProcessor.regenerateAudio(replay.responseText());
+            } else {
+                var start = (IdempotencyDecision.Start) decision;
+                try {
+                    var result = aiTransactionProcessor.process(new ByteArrayResource(audioBytes),
+                            stage -> idempotencyService.markStage(start.operationId(), stage));
+                    idempotencyService.complete(start.operationId(), result.responseText(), result.transactionId());
+                    responseAudio = result.audio();
+                }
+                catch (AiIntegrationException ex) {
+                    idempotencyService.fail(start.operationId(), ex.getStage());
+                    throw ex;
+                }
             }
-            catch (AiIntegrationException ex) {
-                idempotencyService.fail(start.operationId(), ex.getStage());
-                throw ex;
-            }
+
+            var resource = new ByteArrayResource(responseAudio);
+            ResponseEntity<Resource> response = ResponseEntity.ok()
+                    .header(HttpHeaders.CONTENT_DISPOSITION,
+                            ContentDisposition.attachment()
+                                    .filename("audio.mp3")
+                                    .build()
+                                    .toString())
+                    .header("Idempotency-Replayed", String.valueOf(replayed))
+                    .body(resource);
+            success = true;
+            return response;
         }
-
-        var resource = new ByteArrayResource(responseAudio);
-        return ResponseEntity.ok()
-                .header(HttpHeaders.CONTENT_DISPOSITION,
-                        ContentDisposition.attachment()
-                                .filename("audio.mp3")
-                                .build()
-                                .toString())
-                .header("Idempotency-Replayed", String.valueOf(replayed))
-                .body(resource);
+        finally {
+            observability.completeTotal(totalSample, success, replayed);
+        }
     }
 }

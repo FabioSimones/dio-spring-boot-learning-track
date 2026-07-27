@@ -1,5 +1,6 @@
 package dio.budgeting.infrastructure.idempotency;
 
+import dio.budgeting.infrastructure.observability.AiObservability;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -28,15 +29,29 @@ public class IdempotencyCleanupScheduler {
     private static final Logger log = LoggerFactory.getLogger(IdempotencyCleanupScheduler.class);
 
     private final IdempotencyCleanupService cleanupService;
+    private final AiObservability observability;
 
-    public IdempotencyCleanupScheduler(IdempotencyCleanupService cleanupService) {
+    public IdempotencyCleanupScheduler(IdempotencyCleanupService cleanupService, AiObservability observability) {
         this.cleanupService = cleanupService;
+        this.observability = observability;
     }
 
     @Scheduled(fixedDelayString = "${app.idempotency.cleanup-interval}")
     public void run() {
-        int recovered = cleanupService.recoverAbandonedProcessing();
-        int removed = cleanupService.cleanupExpired();
-        log.info("Idempotência: operações abandonadas recuperadas={}, operações expiradas removidas={}", recovered, removed);
+        try {
+            int recovered = cleanupService.recoverAbandonedProcessing();
+            int removed = cleanupService.cleanupExpired();
+            observability.recordCleanup("recovered", recovered);
+            observability.recordCleanup("deleted", removed);
+            log.info("Idempotência: operações abandonadas recuperadas={}, operações expiradas removidas={}", recovered, removed);
+        }
+        catch (RuntimeException ex) {
+            // Per-row conflicts are already handled inside IdempotencyCleanupService
+            // (an OptimisticLockingFailureException there only skips that one row) -
+            // this only guards against a truly unexpected failure of the whole batch
+            // (e.g. a DB connectivity issue), so one bad tick never derails the next.
+            observability.recordCleanupFailure();
+            log.error("Falha inesperada na limpeza de idempotência.", ex);
+        }
     }
 }

@@ -317,6 +317,56 @@ No perfil de teste (`application-test.properties`), `app.idempotency.cleanup-ena
 
 **Índices**: `(status, updated_at)` suporta as consultas de expiração/abandono sem varrer a tabela inteira; a constraint única em `idempotency_key` permanece a proteção real contra duplicação.
 
+## Observabilidade
+
+Correlação, logs estruturados e métricas técnicas para o fluxo de IA (TASK-011) — puramente aditivo: nada aqui influencia o resultado de uma requisição, só mede e registra em cima do que já acontece.
+
+**Correlação por requisição**: envie (opcionalmente) um header `X-Correlation-ID` — se for seguro (até 64 caracteres, apenas letras/números/`._-`, sem espaços/controle) ele é reaproveitado; caso contrário (ausente, vazio, longo demais ou com caracteres inseguros) um novo UUID é gerado silenciosamente, sem rejeitar a requisição. O valor resolvido é devolvido no mesmo header da resposta — em sucesso e em erro — e fica disponível no MDC (`correlationId`) durante toda a requisição, aparecendo em cada linha de log (`CorrelationIdFilter`, um `OncePerRequestFilter`). O MDC é sempre limpo no `finally`, mesmo se a cadeia lançar exceção.
+
+```bash
+curl -X POST \
+  http://localhost:8080/transactions/ai \
+  -H "X-Correlation-ID: teste-local-001" \
+  -H "Idempotency-Key: comando-001" \
+  -F "file=@comando.m4a"
+```
+
+**Componente central**: `AiObservability` é o único ponto de contato com o Micrometer (`MeterRegistry`) no módulo — nenhuma outra classe chama `Counter`/`Timer` diretamente, todas chamam métodos semânticos (`recordUploadRejection`, `recordIdempotencyReplay` etc.).
+
+**Métricas**:
+
+| Métrica | Tipo | Tags | Finalidade |
+| ------- | ---- | ---- | ---------- |
+| `budgeting.ai.requests` | Timer | `result=success\|failure`, `replayed=true\|false` | Duração total do endpoint (inclui replay, quando só a TTS roda) |
+| `budgeting.ai.stage.duration` | Timer | `stage=transcription\|chat\|speech`, `result=success\|failure` | Duração de cada etapa da IA (inclui retries nativos do `spring-ai-retry`) |
+| `budgeting.ai.failures` | Counter | `stage`, `reason` (enum `AiIntegrationException.Reason`, minúsculo) | Falhas por etapa e motivo classificado |
+| `budgeting.ai.upload.rejections` | Counter | `reason=empty\|missing_content_type\|unsupported_type\|too_large\|missing_part\|malformed_multipart` | Arquivos rejeitados antes de qualquer chamada à OpenAI |
+| `budgeting.ai.idempotency.operations` | Counter | `outcome=new` | Operações iniciadas (novas ou reiniciadas para retry) |
+| `budgeting.ai.idempotency.replays` | Counter | (nenhuma) | Replays idempotentes |
+| `budgeting.ai.idempotency.conflicts` | Counter | `reason` (enum `IdempotencyException.Reason`, minúsculo) | Conflitos: payload diferente, em processamento, retry bloqueado |
+| `budgeting.idempotency.cleanup` | Counter | `action=recovered\|deleted\|run`, `result=success\|failure` | Operações recuperadas/removidas pelo scheduler, e falhas inesperadas do lote |
+
+**Cardinalidade**: toda tag vem de um enum ou literal fixo já usado para status HTTP (`Stage`, `Reason`, `AudioCommandStatus`-like outcomes). Nunca aparecem como tag: `correlationId`, `Idempotency-Key`, fingerprint, nome de arquivo, mensagem de exceção, URI ou qualquer valor variável — o que manteria a métrica de baixa cardinalidade indefinidamente alta.
+
+**Duração**: total (`budgeting.ai.requests`) cobre da entrada no endpoint até a resposta final (sucesso ou falha); por etapa (`budgeting.ai.stage.duration`) cobre exatamente a chamada lógica ao `TranscriptionModel`/`ChatClient`/`TextToSpeechModel` feita por `AiTransactionProcessor`, incluindo qualquer retry automático do `spring-ai-retry` (não medido tentativa a tentativa nesta tarefa).
+
+**Idempotência**: `AudioCommandIdempotencyService.begin(...)` registra o resultado uma única vez, no ponto de entrada público — nunca nos métodos privados internos — então uma recuperação oportunista que cai em `resolveFailed` não é contada duas vezes. `MISSING_KEY`/`INVALID_KEY` (erro de validação, não de idempotência) não entram na métrica de conflitos.
+
+**Upload**: `AudioFileValidator` conta suas quatro razões (`empty`, `missing_content_type`, `unsupported_type`, `too_large`); `GlobalExceptionHandler` conta as duas que nunca chegam ao validator (`missing_part`, `malformed_multipart`, mais `too_large` quando o limite do Spring MVC barra antes do validator) — nenhuma razão é contada duas vezes.
+
+**Scheduler**: `IdempotencyCleanupScheduler` registra `recovered`/`deleted` a cada execução (só quando > 0) e uma falha agregada se o lote inteiro lançar uma exceção inesperada (conflitos de `@Version` por linha já são absorvidos dentro de `IdempotencyCleanupService` e não contam como falha do lote).
+
+**Actuator**: adicionado (`spring-boot-starter-actuator`) apenas para expor `MeterRegistry` e os dois endpoints úteis:
+
+```properties
+management.endpoints.web.exposure.include=health,metrics
+management.endpoint.health.show-details=never
+```
+
+`/actuator/env`, `/actuator/beans`, `/actuator/configprops`, `/actuator/heapdump` e qualquer outro endpoint **não** exposto retornam `404` (nunca `*` na configuração).
+
+**Segurança dos logs**: nenhum log ou tag registra áudio, bytes do arquivo, transcrição, prompt, resposta completa da IA, `Idempotency-Key`, fingerprint, API key ou dados financeiros. A exceção original (com stack trace) é logada uma única vez, na camada que primeiro a classifica (`AiTransactionProcessor.classify`, ou o handler correspondente do `GlobalExceptionHandler` para falhas fora da integração de IA) — nunca reemitida em `AiObservability`, que só loga evento/etapa/motivo. O correlation ID em si é um token técnico opaco, nunca a chave de idempotência.
+
 ## Testes automatizados
 
 O projeto combina três níveis de teste, cada um cobrindo uma responsabilidade diferente:
@@ -327,6 +377,7 @@ O projeto combina três níveis de teste, cada um cobrindo uma responsabilidade 
 - **Testes de resiliência da integração com IA** (`AiTransactionProcessorTest`, `OpenAiFailureHandlingTest`) — cobrem a classificação de falhas de transcrição/chat/voz e o mapeamento para `ProblemDetail` (ver [seção de falhas da integração com IA](#falhas-da-integração-com-ia)). Sem chamada real à OpenAI.
 - **Testes de idempotência** (`AudioPayloadFingerprintTest`, `AudioCommandIdempotencyServiceTest`, `TransactionAudioIdempotencyTest`) — cobrem validação da chave, fingerprint SHA-256, replay/conflito/em-processamento/política de retry e a constraint única no H2 (ver [seção de idempotência](#idempotência-do-processamento-por-áudio)). Sem chamada real à OpenAI.
 - **Testes de expiração e limpeza** (`IdempotencyPropertiesTest`, `IdempotencyExpirationPolicyTest`, `IdempotencyCleanupServiceTest`, `IdempotencyCleanupSchedulerTest`, mais os cenários de recuperação/expiração/lock otimista adicionados a `AudioCommandIdempotencyServiceTest`) — cobrem validação de propriedades, limites de janela com `Clock.fixed`, recuperação de `PROCESSING` abandonada por estágio, remoção em lote com H2 real e conflito de `@Version` (ver [seção de expiração e limpeza](#expiração-e-limpeza-task-010)). Scheduler nunca roda automaticamente nos testes; sem chamada real à OpenAI.
+- **Testes de observabilidade** (`CorrelationIdFilterTest`, `AiObservabilityTest`, `AiMetricsIntegrationTest`, `ActuatorEndpointsTest`, mais métricas adicionadas a `AiTransactionProcessorTest`, `AudioFileValidatorTest` e `IdempotencyCleanupSchedulerTest`) — cobrem o filtro de correlação (header, MDC, limpeza, caminho de erro), o contrato de tags/nomes de métrica com `SimpleMeterRegistry`, o fluxo `POST /transactions/ai` de ponta a ponta com `MeterRegistry` real do contexto, e a exposição controlada do Actuator (ver [seção de observabilidade](#observabilidade)). Sem chamada real à OpenAI.
 
 **Banco de teste**: os testes de integração usam H2 em memória (`com.h2database:h2`, dependência apenas em `testRuntimeOnly`), configurado no perfil `test` (`src/test/resources/application-test.properties`, modo de compatibilidade MySQL, schema recriado via `ddl-auto=create-drop`). Não depende de MySQL local nem de Docker. Cada teste roda dentro de uma transação com rollback automático (`@Transactional`), garantindo isolamento sem necessidade de limpeza manual.
 

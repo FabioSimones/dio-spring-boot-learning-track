@@ -8,6 +8,8 @@ import dio.budgeting.infrastructure.idempotency.AudioCommandIdempotencyService;
 import dio.budgeting.infrastructure.idempotency.AudioCommandOperationStore;
 import dio.budgeting.infrastructure.http.audio.InvalidAudioFileException;
 import dio.budgeting.infrastructure.http.error.GlobalExceptionHandler;
+import dio.budgeting.infrastructure.observability.AiObservability;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.audio.transcription.TranscriptionModel;
 import org.springframework.ai.audio.tts.TextToSpeechModel;
@@ -256,7 +258,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void invalidAudioFileException_emptyReason_returns400() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleInvalidAudioFile(
@@ -273,7 +275,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void invalidAudioFileException_unsupportedTypeReason_returns400() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleInvalidAudioFile(
@@ -288,7 +290,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void invalidAudioFileException_tooLargeReason_returns413() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleInvalidAudioFile(
@@ -303,7 +305,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void maxUploadSizeExceededException_returns413_withGenericMessage() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleMaxUploadSizeExceeded(new MaxUploadSizeExceededException(10_485_760), request);
@@ -317,7 +319,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void malformedMultipartRequest_returns400_withGenericMessage() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleMultipartException(new MultipartException("boom"), request);
@@ -331,7 +333,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void aiIntegrationException_transcriptionEmpty_returns422() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleAiIntegrationFailure(new dio.budgeting.infrastructure.ai.AiIntegrationException(
@@ -349,7 +351,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void aiIntegrationException_timeout_returns504() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleAiIntegrationFailure(new dio.budgeting.infrastructure.ai.AiIntegrationException(
@@ -364,7 +366,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void aiIntegrationException_rateLimited_returns503_notRaw429() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleAiIntegrationFailure(new dio.budgeting.infrastructure.ai.AiIntegrationException(
@@ -379,7 +381,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void aiIntegrationException_providerUnavailable_returns503() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleAiIntegrationFailure(new dio.budgeting.infrastructure.ai.AiIntegrationException(
@@ -394,7 +396,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void aiIntegrationException_invalidProviderResponse_returns502() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleAiIntegrationFailure(new dio.budgeting.infrastructure.ai.AiIntegrationException(
@@ -409,7 +411,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void aiIntegrationException_genericFailure_returns502() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleAiIntegrationFailure(new dio.budgeting.infrastructure.ai.AiIntegrationException(
@@ -424,7 +426,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void aiIntegrationException_configurationError_returns500_withoutLeakingCredentialDetails() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleAiIntegrationFailure(new dio.budgeting.infrastructure.ai.AiIntegrationException(
@@ -444,7 +446,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void idempotencyException_missingKey_returns400() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleIdempotencyFailure(new dio.budgeting.infrastructure.idempotency.IdempotencyException(
@@ -461,7 +463,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void idempotencyException_invalidKey_returns400() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleIdempotencyFailure(new dio.budgeting.infrastructure.idempotency.IdempotencyException(
@@ -475,7 +477,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void idempotencyException_payloadConflict_returns409_withoutExposingFingerprint() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleIdempotencyFailure(new dio.budgeting.infrastructure.idempotency.IdempotencyException(
@@ -490,7 +492,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void idempotencyException_inProgress_returns409() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleIdempotencyFailure(new dio.budgeting.infrastructure.idempotency.IdempotencyException(
@@ -504,7 +506,7 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void idempotencyException_retryNotAllowed_returns409() {
-        var handler = new GlobalExceptionHandler();
+        var handler = new GlobalExceptionHandler(new AiObservability(new SimpleMeterRegistry()));
         var request = new MockHttpServletRequest("POST", "/transactions/ai");
 
         var problem = handler.handleIdempotencyFailure(new dio.budgeting.infrastructure.idempotency.IdempotencyException(

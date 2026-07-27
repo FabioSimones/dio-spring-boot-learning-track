@@ -39,6 +39,9 @@ dependencies {
 
     implementation 'org.springframework.boot:spring-boot-starter-validation'
 
+    // TASK-011: MeterRegistry (Micrometer) + /actuator/health, /actuator/metrics.
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+
     implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:3.0.3'
 }
 

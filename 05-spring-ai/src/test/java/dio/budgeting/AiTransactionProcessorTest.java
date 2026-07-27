@@ -7,6 +7,8 @@ import dio.budgeting.infrastructure.ai.AiIntegrationException;
 import dio.budgeting.infrastructure.ai.AiTransactionProcessor;
 import dio.budgeting.infrastructure.ai.OpenAiClientException;
 import dio.budgeting.infrastructure.ai.OpenAiServerException;
+import dio.budgeting.infrastructure.observability.AiObservability;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
@@ -42,6 +44,7 @@ class AiTransactionProcessorTest {
     private ChatClient.ChatClientRequestSpec requestSpec;
     private ChatClient.CallResponseSpec callResponseSpec;
     private AiTransactionProcessor processor;
+    private SimpleMeterRegistry meterRegistry;
 
     private static final Resource AUDIO = mock(Resource.class);
 
@@ -60,8 +63,10 @@ class AiTransactionProcessorTest {
         when(builder.build()).thenReturn(chatClient);
 
         Resource systemPrompt = new ClassPathResource("prompts/system-message.st");
+        meterRegistry = new SimpleMeterRegistry();
         processor = new AiTransactionProcessor(transcriptionModel, systemPrompt, builder, textToSpeechModel,
-                mock(PersistTransactionUseCase.class), mock(ListTransactionsByCategoryUseCase.class));
+                mock(PersistTransactionUseCase.class), mock(ListTransactionsByCategoryUseCase.class),
+                new AiObservability(meterRegistry));
     }
 
     // --- Success ---
@@ -255,5 +260,88 @@ class AiTransactionProcessorTest {
                     assertThat(aiEx.getStage()).isEqualTo(stage);
                     assertThat(aiEx.getReason()).isEqualTo(reason);
                 });
+    }
+
+    // --- TASK-011: stage metrics (SimpleMeterRegistry, no Spring context) ---
+
+    @Test
+    void success_recordsAllThreeStageTimers_asSuccess_noFailureCounted() {
+        when(transcriptionModel.transcribe(any())).thenReturn("Gastei 50 reais no mercado");
+        when(callResponseSpec.content()).thenReturn("Transação registrada com sucesso.");
+        when(textToSpeechModel.call(anyString())).thenReturn(new byte[]{1, 2, 3});
+
+        processor.process(AUDIO);
+
+        assertStageTimerCount("transcription", "success", 1);
+        assertStageTimerCount("chat", "success", 1);
+        assertStageTimerCount("speech", "success", 1);
+        assertThat(meterRegistry.find("budgeting.ai.failures").counters()).isEmpty();
+    }
+
+    @Test
+    void transcriptionFailure_recordsTranscriptionFailureTimerAndCounter_neverMeasuresChatOrSpeech() {
+        when(transcriptionModel.transcribe(any()))
+                .thenThrow(new ResourceAccessException("I/O error", new SocketTimeoutException("Read timed out")));
+
+        assertThatThrownBy(() -> processor.process(AUDIO)).isInstanceOf(AiIntegrationException.class);
+
+        assertStageTimerCount("transcription", "failure", 1);
+        assertThat(meterRegistry.find("budgeting.ai.stage.duration").tag("stage", "chat").timers()).isEmpty();
+        assertThat(meterRegistry.find("budgeting.ai.stage.duration").tag("stage", "speech").timers()).isEmpty();
+        assertFailureCounter("transcription", "timeout", 1);
+    }
+
+    @Test
+    void chatFailure_transcriptionSucceeds_chatFails_speechNeverMeasured() {
+        when(transcriptionModel.transcribe(any())).thenReturn("Gastei 50 reais no mercado");
+        when(callResponseSpec.content()).thenThrow(new OpenAiServerException(503));
+
+        assertThatThrownBy(() -> processor.process(AUDIO)).isInstanceOf(AiIntegrationException.class);
+
+        assertStageTimerCount("transcription", "success", 1);
+        assertStageTimerCount("chat", "failure", 1);
+        assertThat(meterRegistry.find("budgeting.ai.stage.duration").tag("stage", "speech").timers()).isEmpty();
+        assertFailureCounter("chat", "provider_unavailable", 1);
+    }
+
+    @Test
+    void speechFailure_transcriptionAndChatSucceed_speechFails() {
+        when(transcriptionModel.transcribe(any())).thenReturn("Gastei 50 reais no mercado");
+        when(callResponseSpec.content()).thenReturn("Transação registrada.");
+        when(textToSpeechModel.call(anyString())).thenThrow(new OpenAiServerException(500));
+
+        assertThatThrownBy(() -> processor.process(AUDIO)).isInstanceOf(AiIntegrationException.class);
+
+        assertStageTimerCount("transcription", "success", 1);
+        assertStageTimerCount("chat", "success", 1);
+        assertStageTimerCount("speech", "failure", 1);
+        assertFailureCounter("speech", "provider_unavailable", 1);
+    }
+
+    @Test
+    void emptyTranscription_recordsTranscriptionEmptyReason_noDynamicMessageTag() {
+        when(transcriptionModel.transcribe(any())).thenReturn("   ");
+
+        assertThatThrownBy(() -> processor.process(AUDIO)).isInstanceOf(AiIntegrationException.class);
+
+        assertFailureCounter("transcription", "transcription_empty", 1);
+        // Only the controlled stage/reason tags exist - no message/exception-derived tag leaked in.
+        var counter = meterRegistry.find("budgeting.ai.failures")
+                .tag("stage", "transcription").tag("reason", "transcription_empty").counter();
+        assertThat(counter).isNotNull();
+        assertThat(counter.getId().getTags()).hasSize(2);
+    }
+
+    private void assertStageTimerCount(String stage, String result, int expectedCount) {
+        var timer = meterRegistry.find("budgeting.ai.stage.duration").tag("stage", stage).tag("result", result).timer();
+        assertThat(timer).as("timer for stage=%s result=%s", stage, result).isNotNull();
+        assertThat(timer.count()).isEqualTo(expectedCount);
+        assertThat(timer.totalTime(java.util.concurrent.TimeUnit.NANOSECONDS)).isGreaterThanOrEqualTo(0);
+    }
+
+    private void assertFailureCounter(String stage, String reason, double expectedCount) {
+        var counter = meterRegistry.find("budgeting.ai.failures").tag("stage", stage).tag("reason", reason).counter();
+        assertThat(counter).as("failure counter for stage=%s reason=%s", stage, reason).isNotNull();
+        assertThat(counter.count()).isEqualTo(expectedCount);
     }
 }

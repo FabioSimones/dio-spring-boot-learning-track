@@ -6,6 +6,7 @@ import dio.budgeting.domain.InvalidTransactionException;
 import dio.budgeting.infrastructure.ai.AiIntegrationException;
 import dio.budgeting.infrastructure.http.audio.InvalidAudioFileException;
 import dio.budgeting.infrastructure.idempotency.IdempotencyException;
+import dio.budgeting.infrastructure.observability.AiObservability;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,6 +20,7 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.MultipartException;
 import org.springframework.web.multipart.support.MissingServletRequestPartException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.net.URI;
 import java.time.OffsetDateTime;
@@ -30,6 +32,12 @@ import java.util.stream.Collectors;
 public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    private final AiObservability observability;
+
+    public GlobalExceptionHandler(AiObservability observability) {
+        this.observability = observability;
+    }
 
     @ExceptionHandler(InvalidTransactionException.class)
     public ProblemDetail handleInvalidTransaction(InvalidTransactionException ex, HttpServletRequest request) {
@@ -82,18 +90,25 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(MissingServletRequestPartException.class)
     public ProblemDetail handleMissingPart(MissingServletRequestPartException ex, HttpServletRequest request) {
+        // Counted here, not in AudioFileValidator: the part is missing before the
+        // validator ever runs, so this is the single point for this reason.
+        observability.recordUploadRejection("missing_part");
         return problemDetail(HttpStatus.BAD_REQUEST, "Arquivo obrigatório",
                 "O arquivo de áudio é obrigatório.", request);
     }
 
     @ExceptionHandler(MaxUploadSizeExceededException.class)
     public ProblemDetail handleMaxUploadSizeExceeded(MaxUploadSizeExceededException ex, HttpServletRequest request) {
+        // Spring MVC's own multipart size limit, enforced before the controller/validator
+        // ever runs - mutually exclusive with AudioFileValidator's own "too_large" check.
+        observability.recordUploadRejection("too_large");
         return problemDetail(HttpStatus.CONTENT_TOO_LARGE, "Arquivo muito grande",
                 "O arquivo enviado excede o tamanho máximo permitido.", request);
     }
 
     @ExceptionHandler(MultipartException.class)
     public ProblemDetail handleMultipartException(MultipartException ex, HttpServletRequest request) {
+        observability.recordUploadRejection("malformed_multipart");
         return problemDetail(HttpStatus.BAD_REQUEST, "Requisição inválida",
                 "A requisição multipart está ausente ou possui formato inválido.", request);
     }
@@ -144,6 +159,12 @@ public class GlobalExceptionHandler {
             case RETRY_NOT_ALLOWED -> "Reprocessamento não permitido";
         };
         return problemDetail(status, title, ex.getMessage(), request);
+    }
+
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ProblemDetail handleNoResourceFound(NoResourceFoundException ex, HttpServletRequest request) {
+        return problemDetail(HttpStatus.NOT_FOUND, "Recurso não encontrado",
+                "O recurso solicitado não existe.", request);
     }
 
     @ExceptionHandler(Exception.class)

@@ -3,6 +3,8 @@ package dio.budgeting.infrastructure.ai;
 import dio.budgeting.application.ListTransactionsByCategoryUseCase;
 import dio.budgeting.application.PersistTransactionUseCase;
 import dio.budgeting.domain.InvalidTransactionException;
+import dio.budgeting.infrastructure.observability.AiObservability;
+import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.audio.transcription.TranscriptionModel;
@@ -17,6 +19,7 @@ import org.springframework.web.client.ResourceAccessException;
 
 import java.io.IOException;
 import java.nio.charset.Charset;
+import java.util.Locale;
 import java.util.function.Consumer;
 
 /**
@@ -44,13 +47,15 @@ public class AiTransactionProcessor {
     private final TranscriptionModel transcriptionModel;
     private final ChatClient chatClient;
     private final TextToSpeechModel textToSpeechModel;
+    private final AiObservability observability;
 
     public AiTransactionProcessor(TranscriptionModel transcriptionModel,
                                    @Value("classpath:prompts/system-message.st") Resource systemPrompt,
                                    ChatClient.Builder chatClientBuilder,
                                    TextToSpeechModel textToSpeechModel,
                                    PersistTransactionUseCase persistTransactionUseCase,
-                                   ListTransactionsByCategoryUseCase listTransactionsByCategoryUseCase)
+                                   ListTransactionsByCategoryUseCase listTransactionsByCategoryUseCase,
+                                   AiObservability observability)
             throws IOException {
         this.transcriptionModel = transcriptionModel;
         this.chatClient = chatClientBuilder
@@ -58,6 +63,7 @@ public class AiTransactionProcessor {
                 .defaultTools(persistTransactionUseCase, listTransactionsByCategoryUseCase)
                 .build();
         this.textToSpeechModel = textToSpeechModel;
+        this.observability = observability;
     }
 
     public AiTransactionResult process(Resource audioResource) {
@@ -91,24 +97,31 @@ public class AiTransactionProcessor {
         return synthesize(responseText);
     }
 
+    private static final String STAGE_TRANSCRIPTION = "transcription";
+    private static final String STAGE_CHAT = "chat";
+    private static final String STAGE_SPEECH = "speech";
+
     private String transcribe(Resource audioResource) {
+        var sample = observability.startStage(STAGE_TRANSCRIPTION);
         String text;
         try {
             text = transcriptionModel.transcribe(audioResource);
         }
         catch (RuntimeException ex) {
-            throw classify(AiIntegrationException.Stage.TRANSCRIPTION, ex);
+            throw fail(sample, STAGE_TRANSCRIPTION, classify(AiIntegrationException.Stage.TRANSCRIPTION, ex));
         }
         if (text == null || text.isBlank()) {
             log.warn("Falha na etapa de transcrição. reason={}", AiIntegrationException.Reason.TRANSCRIPTION_EMPTY);
-            throw new AiIntegrationException(AiIntegrationException.Stage.TRANSCRIPTION,
+            throw fail(sample, STAGE_TRANSCRIPTION, new AiIntegrationException(AiIntegrationException.Stage.TRANSCRIPTION,
                     AiIntegrationException.Reason.TRANSCRIPTION_EMPTY,
-                    "Não foi possível identificar conteúdo falado no áudio.");
+                    "Não foi possível identificar conteúdo falado no áudio."));
         }
+        observability.completeStageSuccess(sample, STAGE_TRANSCRIPTION);
         return text;
     }
 
     private String chat(String transcript) {
+        var sample = observability.startStage(STAGE_CHAT);
         String content;
         try {
             content = chatClient.prompt().user(transcript).call().content();
@@ -120,35 +133,54 @@ public class AiTransactionProcessor {
             // as a propagated exception - verified in DefaultToolExecutionExceptionProcessor.
             // If that ever changes, a rejected user command must still surface as the
             // existing domain-error contract (400 Transação inválida), not as an AI failure.
+            // Not a stage failure in the AI-observability sense (no AiIntegrationException,
+            // no classified Reason) - this path is unreachable under the current framework
+            // behavior, so the stage timer sample is simply left unrecorded rather than
+            // forcing an artificial reason tag onto the controlled vocabulary.
             throw ex;
         }
         catch (RuntimeException ex) {
-            throw classify(AiIntegrationException.Stage.CHAT, ex);
+            throw fail(sample, STAGE_CHAT, classify(AiIntegrationException.Stage.CHAT, ex));
         }
         if (content == null || content.isBlank()) {
             log.warn("Falha na etapa de chat. reason={}", AiIntegrationException.Reason.INVALID_PROVIDER_RESPONSE);
-            throw new AiIntegrationException(AiIntegrationException.Stage.CHAT,
+            throw fail(sample, STAGE_CHAT, new AiIntegrationException(AiIntegrationException.Stage.CHAT,
                     AiIntegrationException.Reason.INVALID_PROVIDER_RESPONSE,
-                    "A inteligência artificial não retornou uma resposta válida.");
+                    "A inteligência artificial não retornou uma resposta válida."));
         }
+        observability.completeStageSuccess(sample, STAGE_CHAT);
         return content;
     }
 
     private byte[] synthesize(String text) {
+        var sample = observability.startStage(STAGE_SPEECH);
         byte[] audio;
         try {
             audio = textToSpeechModel.call(text);
         }
         catch (RuntimeException ex) {
-            throw classify(AiIntegrationException.Stage.SPEECH, ex);
+            throw fail(sample, STAGE_SPEECH, classify(AiIntegrationException.Stage.SPEECH, ex));
         }
         if (audio == null || audio.length == 0) {
             log.warn("Falha na etapa de geração de voz. reason={}", AiIntegrationException.Reason.INVALID_PROVIDER_RESPONSE);
-            throw new AiIntegrationException(AiIntegrationException.Stage.SPEECH,
+            throw fail(sample, STAGE_SPEECH, new AiIntegrationException(AiIntegrationException.Stage.SPEECH,
                     AiIntegrationException.Reason.INVALID_PROVIDER_RESPONSE,
-                    "Não foi possível gerar a resposta em áudio.");
+                    "Não foi possível gerar a resposta em áudio."));
         }
+        observability.completeStageSuccess(sample, STAGE_SPEECH);
         return audio;
+    }
+
+    /**
+     * Records the stage timer (result=failure) and the failure counter in one
+     * call, then returns the exception unchanged for the caller to throw - the
+     * exception's own stack trace is logged exactly once, in {@link #classify}
+     * or the caller's existing {@code log.warn} for validation failures; this
+     * never logs the exception itself.
+     */
+    private AiIntegrationException fail(Timer.Sample sample, String stage, AiIntegrationException exception) {
+        observability.completeStageFailure(sample, stage, exception.getReason().name().toLowerCase(Locale.ROOT));
+        return exception;
     }
 
     /**

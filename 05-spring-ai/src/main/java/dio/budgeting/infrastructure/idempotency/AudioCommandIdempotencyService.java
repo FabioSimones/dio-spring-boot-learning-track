@@ -1,10 +1,12 @@
 package dio.budgeting.infrastructure.idempotency;
 
 import dio.budgeting.infrastructure.ai.AiIntegrationException;
+import dio.budgeting.infrastructure.observability.AiObservability;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 
+import java.util.Locale;
 import java.util.UUID;
 
 /**
@@ -35,15 +37,41 @@ public class AudioCommandIdempotencyService {
 
     private final AudioCommandOperationStore store;
     private final IdempotencyExpirationPolicy policy;
+    private final AiObservability observability;
 
-    public AudioCommandIdempotencyService(AudioCommandOperationStore store, IdempotencyExpirationPolicy policy) {
+    public AudioCommandIdempotencyService(AudioCommandOperationStore store, IdempotencyExpirationPolicy policy,
+                                           AiObservability observability) {
         this.store = store;
         this.policy = policy;
+        this.observability = observability;
     }
 
+    /**
+     * TASK-011: every outcome is recorded exactly once here, at the single
+     * public entry point - never scattered across the private resolve* methods
+     * below - so a decision is never double-counted regardless of how many
+     * internal branches it passed through (e.g. an opportunistic recovery that
+     * falls through to {@code resolveFailed}). {@code MISSING_KEY}/{@code
+     * INVALID_KEY} (thrown by {@code IdempotencyKeyValidator} before the try
+     * block) are input validation, not idempotency conflicts, so they are
+     * deliberately not counted here.
+     */
     public IdempotencyDecision begin(String idempotencyKey, String payloadFingerprint) {
         IdempotencyKeyValidator.validate(idempotencyKey);
-        return beginAfterValidation(idempotencyKey, payloadFingerprint, true);
+        try {
+            var decision = beginAfterValidation(idempotencyKey, payloadFingerprint, true);
+            if (decision instanceof IdempotencyDecision.Replay) {
+                observability.recordIdempotencyReplay();
+            }
+            else {
+                observability.recordIdempotencyStart();
+            }
+            return decision;
+        }
+        catch (IdempotencyException ex) {
+            observability.recordIdempotencyConflict(ex.getReason().name().toLowerCase(Locale.ROOT));
+            throw ex;
+        }
     }
 
     private IdempotencyDecision beginAfterValidation(String idempotencyKey, String payloadFingerprint,
