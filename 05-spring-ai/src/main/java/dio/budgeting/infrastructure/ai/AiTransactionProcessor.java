@@ -222,7 +222,12 @@ public class AiTransactionProcessor {
             }
         }
 
-        log.warn("Falha na etapa de integração com IA. stage={} reason={}", stage, reason, ex);
+        // No exception object here (TASK-013 audit finding): the stack trace of
+        // "ex" (and its full cause chain) is logged exactly once, downstream in
+        // GlobalExceptionHandler.handleAiIntegrationFailure, which receives this
+        // same cause via the AiIntegrationException constructed below. Logging
+        // it again here would duplicate the same trace at every failure.
+        log.warn("Falha na etapa de integração com IA. stage={} reason={}", stage, reason);
         return new AiIntegrationException(stage, reason, messageFor(reason), ex);
     }
 

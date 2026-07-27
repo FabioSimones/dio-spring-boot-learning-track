@@ -19,6 +19,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
@@ -33,6 +34,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -160,10 +162,60 @@ class OpenAiFailureHandlingTest {
                 .thenReturn(new AiTransactionResult(new byte[]{1, 2, 3}, "Transação registrada.", null));
 
         mockMvc.perform(multipart("/transactions/ai").file(audioFile()))
-                .andExpect(status().isOk());
+                .andExpect(status().isOk())
+                .andExpect(header().string("Cache-Control", "no-store"));
 
         verify(audioFileValidator).validate(any());
         verify(aiTransactionProcessor).process(any(), any());
         verify(idempotencyService).complete(any(), org.mockito.ArgumentMatchers.eq("Transação registrada."), any());
+    }
+
+    // --- TASK-013 audit: a race between this request and IdempotencyCleanupScheduler
+    // recovering the same row must never turn a real success/failure into an
+    // unrelated 500 - see TransactionController's *IgnoringConflict helpers.
+
+    @Test
+    void success_stillReturnsAudio_evenWhenIdempotencyCompleteRacesWithScheduler() throws Exception {
+        doNothing().when(audioFileValidator).validate(any());
+        when(aiTransactionProcessor.process(any(), any()))
+                .thenReturn(new AiTransactionResult(new byte[]{1, 2, 3}, "Transação registrada.", null));
+        doThrow(new OptimisticLockingFailureException("lost the race to the scheduler"))
+                .when(idempotencyService).complete(any(), any(), any());
+
+        mockMvc.perform(multipart("/transactions/ai").file(audioFile()))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsByteArray();
+
+        verify(idempotencyService).complete(any(), any(), any());
+    }
+
+    @Test
+    void aiIntegrationFailure_stillMapsToOriginalError_evenWhenIdempotencyFailRacesWithScheduler() throws Exception {
+        doNothing().when(audioFileValidator).validate(any());
+        when(aiTransactionProcessor.process(any(), any()))
+                .thenThrow(new AiIntegrationException(AiIntegrationException.Stage.CHAT,
+                        AiIntegrationException.Reason.PROVIDER_UNAVAILABLE, "indisponível"));
+        doThrow(new OptimisticLockingFailureException("lost the race to the scheduler"))
+                .when(idempotencyService).fail(any(), any());
+
+        mockMvc.perform(multipart("/transactions/ai").file(audioFile()))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.title").value("Serviço de IA temporariamente indisponível"));
+    }
+
+    @Test
+    void markStageConflict_neverAbortsProcessing() throws Exception {
+        doNothing().when(audioFileValidator).validate(any());
+        doThrow(new OptimisticLockingFailureException("lost the race to the scheduler"))
+                .when(idempotencyService).markStage(any(), any());
+        when(aiTransactionProcessor.process(any(), any())).thenAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            var stageTracker = (java.util.function.Consumer<AiIntegrationException.Stage>) invocation.getArgument(1);
+            stageTracker.accept(AiIntegrationException.Stage.TRANSCRIPTION);
+            return new AiTransactionResult(new byte[]{1}, "Transação registrada.", null);
+        });
+
+        mockMvc.perform(multipart("/transactions/ai").file(audioFile()))
+                .andExpect(status().isOk());
     }
 }

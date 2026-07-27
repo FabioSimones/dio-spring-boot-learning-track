@@ -22,19 +22,25 @@ import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.core.io.Resource;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/transactions")
 @Tag(name = "Transactions", description = "Cadastro e consulta de transações financeiras, via REST tradicional ou comando de voz (transcrição + IA + Tool Calling + texto-para-voz)")
 public class TransactionController {
+    private static final Logger log = LoggerFactory.getLogger(TransactionController.class);
+
     private final PersistTransactionUseCase persistTransactionUseCase;
     private final ListTransactionsByCategoryUseCase listTransactionsByCategoryUseCase;
 
@@ -397,12 +403,12 @@ public class TransactionController {
                 var start = (IdempotencyDecision.Start) decision;
                 try {
                     var result = aiTransactionProcessor.process(new ByteArrayResource(audioBytes),
-                            stage -> idempotencyService.markStage(start.operationId(), stage));
-                    idempotencyService.complete(start.operationId(), result.responseText(), result.transactionId());
+                            stage -> markStageIgnoringConflict(start.operationId(), stage));
+                    completeIgnoringConflict(start.operationId(), result.responseText(), result.transactionId());
                     responseAudio = result.audio();
                 }
                 catch (AiIntegrationException ex) {
-                    idempotencyService.fail(start.operationId(), ex.getStage());
+                    failIgnoringConflict(start.operationId(), ex.getStage());
                     throw ex;
                 }
             }
@@ -415,12 +421,49 @@ public class TransactionController {
                                     .build()
                                     .toString())
                     .header("Idempotency-Replayed", String.valueOf(replayed))
+                    .header(HttpHeaders.CACHE_CONTROL, "no-store")
                     .body(resource);
             success = true;
             return response;
         }
         finally {
             observability.completeTotal(totalSample, success, replayed);
+        }
+    }
+
+    /**
+     * The idempotency bookkeeping row can lose an optimistic-lock race against
+     * {@code IdempotencyCleanupScheduler} recovering the same row as abandoned
+     * (TASK-013 audit finding): the AI pipeline already produced a real result,
+     * so a conflict here must never turn into an HTTP 500 for a request that
+     * actually succeeded - it only means the tracking row itself may end up in
+     * a stale FAILED state (safe direction: at worst it blocks a future retry
+     * with the same key, never allows an unsafe one).
+     */
+    private void markStageIgnoringConflict(UUID operationId, AiIntegrationException.Stage stage) {
+        try {
+            idempotencyService.markStage(operationId, stage);
+        }
+        catch (OptimisticLockingFailureException raceLost) {
+            log.warn("Conflito otimista ao atualizar estágio da operação idempotente; processamento continua.");
+        }
+    }
+
+    private void completeIgnoringConflict(UUID operationId, String responseText, UUID transactionId) {
+        try {
+            idempotencyService.complete(operationId, responseText, transactionId);
+        }
+        catch (OptimisticLockingFailureException raceLost) {
+            log.warn("Conflito otimista ao concluir operação idempotente; resposta ao cliente não é afetada.");
+        }
+    }
+
+    private void failIgnoringConflict(UUID operationId, AiIntegrationException.Stage stage) {
+        try {
+            idempotencyService.fail(operationId, stage);
+        }
+        catch (OptimisticLockingFailureException raceLost) {
+            log.warn("Conflito otimista ao marcar operação idempotente como falha; erro original será propagado.");
         }
     }
 }

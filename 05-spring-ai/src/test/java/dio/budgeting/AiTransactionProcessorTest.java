@@ -8,10 +8,14 @@ import dio.budgeting.infrastructure.ai.AiTransactionProcessor;
 import dio.budgeting.infrastructure.ai.OpenAiClientException;
 import dio.budgeting.infrastructure.ai.OpenAiServerException;
 import dio.budgeting.infrastructure.observability.AiObservability;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.audio.transcription.TranscriptionModel;
 import org.springframework.ai.audio.tts.TextToSpeechModel;
 import org.springframework.ai.chat.client.ChatClient;
@@ -45,6 +49,7 @@ class AiTransactionProcessorTest {
     private ChatClient.CallResponseSpec callResponseSpec;
     private AiTransactionProcessor processor;
     private SimpleMeterRegistry meterRegistry;
+    private ListAppender<ILoggingEvent> logAppender;
 
     private static final Resource AUDIO = mock(Resource.class);
 
@@ -67,6 +72,17 @@ class AiTransactionProcessorTest {
         processor = new AiTransactionProcessor(transcriptionModel, systemPrompt, builder, textToSpeechModel,
                 mock(PersistTransactionUseCase.class), mock(ListTransactionsByCategoryUseCase.class),
                 new AiObservability(meterRegistry));
+
+        var processorLogger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(AiTransactionProcessor.class);
+        logAppender = new ListAppender<>();
+        logAppender.start();
+        processorLogger.addAppender(logAppender);
+    }
+
+    @AfterEach
+    void tearDown() {
+        var processorLogger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(AiTransactionProcessor.class);
+        processorLogger.detachAppender(logAppender);
     }
 
     // --- Success ---
@@ -98,6 +114,26 @@ class AiTransactionProcessorTest {
         assertFailure(() -> processor.process(AUDIO), AiIntegrationException.Stage.TRANSCRIPTION,
                 AiIntegrationException.Reason.TIMEOUT);
         verifyNoInteractions(textToSpeechModel);
+    }
+
+    // --- TASK-013 audit: classify() must not log the exception a second time -
+    // GlobalExceptionHandler is the single place that logs the full stack trace.
+
+    @Test
+    void classifiedFailure_logsWarningWithoutStackTrace_toAvoidDoubleLoggingWithGlobalExceptionHandler() {
+        when(transcriptionModel.transcribe(any()))
+                .thenThrow(new ResourceAccessException("I/O error", new SocketTimeoutException("Read timed out")));
+
+        assertThatThrownBy(() -> processor.process(AUDIO)).isInstanceOf(AiIntegrationException.class);
+
+        assertThat(logAppender.list).isNotEmpty();
+        var classificationLog = logAppender.list.stream()
+                .filter(event -> event.getFormattedMessage().contains("Falha na etapa de integração com IA"))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("expected a classification log event"));
+        assertThat(classificationLog.getThrowableProxy())
+                .as("classify() must not attach the exception - GlobalExceptionHandler logs it once, downstream")
+                .isNull();
     }
 
     @Test
