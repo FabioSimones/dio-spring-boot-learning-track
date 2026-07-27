@@ -267,9 +267,55 @@ curl -X POST \
 
 **Concorrência**: a proteção real é uma constraint única de banco em `idempotency_key` (não uma checagem em memória). Duas requisições simultâneas com uma chave nova podem ambas passar pela checagem inicial; a constraint garante que só uma consegue persistir a operação, e a outra recebe "operação em processamento".
 
-**O que não é feito**: o áudio (enviado ou gerado) nunca é armazenado — apenas o texto final e seguro do ChatClient, usado para regenerar o áudio em um replay. Chaves não expiram nem são limpas nesta tarefa (ficam retidas indefinidamente); retenção/limpeza automática é uma limitação conhecida para uma tarefa futura.
+**O que não é feito**: o áudio (enviado ou gerado) nunca é armazenado — apenas o texto final e seguro do ChatClient, usado para regenerar o áudio em um replay.
 
 **Risco residual**: se o Tool Calling já persistiu a transação e a geração de voz falhar depois, a operação é marcada como falha bloqueada para retry — a transação criada não é desfeita automaticamente (sem compensação nesta tarefa).
+
+### Expiração e limpeza (TASK-010)
+
+Chaves não são retidas para sempre: cada operação tem uma janela de retenção configurável, depois da qual o registro é removido e a chave pode ser reutilizada como se fosse uma operação nova.
+
+| Estado | Janela (padrão) | Ação após expiração |
+| ------ | ---------------- | -------------------- |
+| `COMPLETED` | 24h (`app.idempotency.completed-retention`) | Removida; a chave pode iniciar uma nova operação |
+| `FAILED` (qualquer estágio) | 24h (`app.idempotency.failed-retention`) | Removida; a chave pode iniciar uma nova operação |
+| `PROCESSING` | 15 min de inatividade (`app.idempotency.processing-timeout`) | Considerada abandonada e recuperada (nunca reprocessada automaticamente) |
+
+**Aviso importante**: a idempotência é garantida apenas durante a janela configurada. Após a expiração e remoção do registro, a mesma chave poderá ser tratada como uma nova operação — reenviar o mesmo comando de voz depois desse ponto pode gerar uma nova transação. Use uma chave nova por intenção de comando; nunca reutilize propositalmente uma chave antiga esperando bloqueio eterno.
+
+**Operações `PROCESSING` abandonadas** (ex.: a aplicação caiu no meio do processamento) são recuperadas com base no estágio alcançado, registrado em `currentStage` (`REGISTERED`/`TRANSCRIPTION`/`CHAT`/`SPEECH`, atualizado antes de cada chamada externa — transcrição, ChatClient/Tool Calling, geração de voz):
+
+- **`REGISTERED` ou `TRANSCRIPTION`** (Tool Calling ainda não rodou): a operação é marcada `FAILED`/`TRANSCRIPTION` e a **mesma chave permite retry** na próxima requisição, seguindo a política já existente.
+- **`CHAT` ou `SPEECH`** (Tool Calling pode já ter persistido uma transação): a operação é marcada `FAILED` no estágio correspondente e o **retry continua bloqueado** — nunca presumimos que nenhum efeito colateral ocorreu.
+- **Estágio desconhecido/nulo** (linha de um schema anterior a esta tarefa): tratado de forma conservadora como inseguro, igual a `CHAT`/`SPEECH`.
+
+Essa recuperação acontece de duas formas, sempre com a mesma política (`IdempotencyExpirationPolicy`), nunca duplicada:
+
+- **Oportunisticamente**, dentro do próprio `begin()` — uma operação abandonada há horas não espera a próxima execução do scheduler para ser resolvida.
+- **Periodicamente**, via `IdempotencyCleanupScheduler` (`@Scheduled`, intervalo `app.idempotency.cleanup-interval`), que primeiro recupera `PROCESSING` abandonadas e depois remove `COMPLETED`/`FAILED` expiradas, uma transação curta por linha (nunca mantém transação aberta durante qualquer chamada externa — não há chamada externa nesse fluxo).
+
+**Configuração** (`application.properties`, todos sob `app.idempotency.*`, tipados via `IdempotencyProperties`/`Duration`, validados na inicialização - duração zero ou negativa falha o startup):
+
+```properties
+app.idempotency.completed-retention=24h
+app.idempotency.failed-retention=24h
+app.idempotency.processing-timeout=15m
+app.idempotency.cleanup-interval=PT1H
+app.idempotency.cleanup-enabled=true
+app.idempotency.batch-size=100
+```
+
+`cleanup-interval` usa formato ISO-8601 (`PT1H`) propositalmente: além de ser lido como `Duration` tipado, o mesmo valor é lido cru por `@Scheduled(fixedDelayString = ...)`, que só entende ISO-8601 ou milissegundos — não os sufixos simples (`24h`) usados nas outras propriedades.
+
+No perfil de teste (`application-test.properties`), `app.idempotency.cleanup-enabled=false` desativa o bean do scheduler (`@ConditionalOnProperty`) para que nenhuma limpeza automática rode em paralelo com os testes; os testes chamam `IdempotencyCleanupService`/`IdempotencyCleanupScheduler` diretamente.
+
+**Relógio**: toda leitura de hora nesta área passa por um único `Clock` injetável (`Clock.systemUTC()` em produção), nunca `OffsetDateTime.now()` espalhado pelo código — o que permite testes determinísticos com `Clock.fixed` sem `Thread.sleep`.
+
+**Concorrência entre scheduler e requisição**: cada linha usa `@Version` (lock otimista já existente). Se o scheduler tentar recuperar uma linha que a própria requisição acabou de concluir/falhar, o conflito gera `OptimisticLockingFailureException`, que o scheduler apenas registra e ignora — a linha é reavaliada na próxima execução, nunca derruba o lote inteiro.
+
+**Concorrência entre limpeza e replay**: a exclusão em lote revalida `status`+`updatedAt` na própria cláusula `WHERE` no momento do delete, então uma linha que mudou de estado entre a consulta e a exclusão (ex.: um retry que voltou `FAILED` → `PROCESSING`) nunca é removida por engano. Um replay em andamento não é afetado: o texto necessário (`responseText`) já é lido antes de qualquer exclusão.
+
+**Índices**: `(status, updated_at)` suporta as consultas de expiração/abandono sem varrer a tabela inteira; a constraint única em `idempotency_key` permanece a proteção real contra duplicação.
 
 ## Testes automatizados
 
@@ -280,6 +326,7 @@ O projeto combina três níveis de teste, cada um cobrindo uma responsabilidade 
 - **Testes de integração REST** (`TransactionRestIntegrationTest`) — percorrem o fluxo completo e real: `MockMvc` → `TransactionController` → `PersistTransactionUseCase`/`ListTransactionsByCategoryUseCase` → `JpaTransactionRepository` → `TransactionEntityRepository` (Spring Data JPA) → banco H2 em memória, com resposta HTTP serializada de volta. Nenhum componente de negócio é mockado aqui; apenas o banco é isolado.
 - **Testes de resiliência da integração com IA** (`AiTransactionProcessorTest`, `OpenAiFailureHandlingTest`) — cobrem a classificação de falhas de transcrição/chat/voz e o mapeamento para `ProblemDetail` (ver [seção de falhas da integração com IA](#falhas-da-integração-com-ia)). Sem chamada real à OpenAI.
 - **Testes de idempotência** (`AudioPayloadFingerprintTest`, `AudioCommandIdempotencyServiceTest`, `TransactionAudioIdempotencyTest`) — cobrem validação da chave, fingerprint SHA-256, replay/conflito/em-processamento/política de retry e a constraint única no H2 (ver [seção de idempotência](#idempotência-do-processamento-por-áudio)). Sem chamada real à OpenAI.
+- **Testes de expiração e limpeza** (`IdempotencyPropertiesTest`, `IdempotencyExpirationPolicyTest`, `IdempotencyCleanupServiceTest`, `IdempotencyCleanupSchedulerTest`, mais os cenários de recuperação/expiração/lock otimista adicionados a `AudioCommandIdempotencyServiceTest`) — cobrem validação de propriedades, limites de janela com `Clock.fixed`, recuperação de `PROCESSING` abandonada por estágio, remoção em lote com H2 real e conflito de `@Version` (ver [seção de expiração e limpeza](#expiração-e-limpeza-task-010)). Scheduler nunca roda automaticamente nos testes; sem chamada real à OpenAI.
 
 **Banco de teste**: os testes de integração usam H2 em memória (`com.h2database:h2`, dependência apenas em `testRuntimeOnly`), configurado no perfil `test` (`src/test/resources/application-test.properties`, modo de compatibilidade MySQL, schema recriado via `ddl-auto=create-drop`). Não depende de MySQL local nem de Docker. Cada teste roda dentro de uma transação com rollback automático (`@Transactional`), garantindo isolamento sem necessidade de limpeza manual.
 

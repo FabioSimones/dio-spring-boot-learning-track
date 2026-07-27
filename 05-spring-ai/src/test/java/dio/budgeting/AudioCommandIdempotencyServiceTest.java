@@ -7,12 +7,17 @@ import dio.budgeting.infrastructure.idempotency.AudioCommandOperationRepository;
 import dio.budgeting.infrastructure.idempotency.AudioCommandStatus;
 import dio.budgeting.infrastructure.idempotency.IdempotencyDecision;
 import dio.budgeting.infrastructure.idempotency.IdempotencyException;
+import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.annotation.Transactional;
+
+import java.time.OffsetDateTime;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -33,6 +38,9 @@ class AudioCommandIdempotencyServiceTest {
 
     @Autowired
     AudioCommandOperationRepository repository;
+
+    @Autowired
+    EntityManager entityManager;
 
     // --- Key validation ---
 
@@ -164,9 +172,10 @@ class AudioCommandIdempotencyServiceTest {
 
     @Test
     void uniqueConstraint_rejectsSecondRowWithSameIdempotencyKey() {
-        repository.save(new AudioCommandOperationEntity("key-unique", "fp-1"));
+        var now = OffsetDateTime.now();
+        repository.save(new AudioCommandOperationEntity("key-unique", "fp-1", now));
 
-        assertThatThrownBy(() -> repository.saveAndFlush(new AudioCommandOperationEntity("key-unique", "fp-2")))
+        assertThatThrownBy(() -> repository.saveAndFlush(new AudioCommandOperationEntity("key-unique", "fp-2", now)))
                 .isInstanceOf(DataIntegrityViolationException.class);
     }
 
@@ -174,5 +183,129 @@ class AudioCommandIdempotencyServiceTest {
         assertThatThrownBy(action::run)
                 .isInstanceOf(IdempotencyException.class)
                 .satisfies(ex -> assertThat(((IdempotencyException) ex).getReason()).isEqualTo(reason));
+    }
+
+    // --- TASK-010: abandoned PROCESSING recovery (opportunistic, inside begin()) ---
+
+    @Test
+    void processingAbandonedAtRegistered_recoversAndAllowsRetry() {
+        var start = (IdempotencyDecision.Start) service.begin("key-abandoned-registered", "fp-abandoned");
+        backdateUpdatedAt(start.operationId(), OffsetDateTime.now().minusMinutes(20));
+
+        var decision = service.begin("key-abandoned-registered", "fp-abandoned");
+
+        assertThat(decision).isInstanceOf(IdempotencyDecision.Start.class);
+        var entity = repository.findByIdempotencyKey("key-abandoned-registered").orElseThrow();
+        assertThat(entity.getStatus()).isEqualTo(AudioCommandStatus.PROCESSING);
+        assertThat(entity.getFailureStage()).isNull();
+    }
+
+    @Test
+    void processingAbandonedAtChat_isMarkedFailed_andBlocksRetry() {
+        var start = (IdempotencyDecision.Start) service.begin("key-abandoned-chat", "fp-abandoned");
+        service.markStage(start.operationId(), AiIntegrationException.Stage.CHAT);
+        backdateUpdatedAt(start.operationId(), OffsetDateTime.now().minusMinutes(20));
+
+        assertReason(() -> service.begin("key-abandoned-chat", "fp-abandoned"), IdempotencyException.Reason.RETRY_NOT_ALLOWED);
+        var entity = repository.findByIdempotencyKey("key-abandoned-chat").orElseThrow();
+        assertThat(entity.getStatus()).isEqualTo(AudioCommandStatus.FAILED);
+        assertThat(entity.getFailureStage()).isEqualTo(AiIntegrationException.Stage.CHAT);
+    }
+
+    @Test
+    void processingAbandonedAtSpeech_blocksRetry() {
+        var start = (IdempotencyDecision.Start) service.begin("key-abandoned-speech", "fp-abandoned");
+        service.markStage(start.operationId(), AiIntegrationException.Stage.SPEECH);
+        backdateUpdatedAt(start.operationId(), OffsetDateTime.now().minusMinutes(20));
+
+        assertReason(() -> service.begin("key-abandoned-speech", "fp-abandoned"), IdempotencyException.Reason.RETRY_NOT_ALLOWED);
+        var entity = repository.findByIdempotencyKey("key-abandoned-speech").orElseThrow();
+        assertThat(entity.getFailureStage()).isEqualTo(AiIntegrationException.Stage.SPEECH);
+    }
+
+    @Test
+    void processingAbandonedWithUnknownStage_isTreatedAsUnsafe() {
+        var start = (IdempotencyDecision.Start) service.begin("key-abandoned-unknown", "fp-abandoned");
+        var entity = repository.findById(start.operationId()).orElseThrow();
+        entity.setCurrentStage(null);
+        entity.setUpdatedAt(OffsetDateTime.now().minusMinutes(20));
+        repository.save(entity);
+
+        assertReason(() -> service.begin("key-abandoned-unknown", "fp-abandoned"), IdempotencyException.Reason.RETRY_NOT_ALLOWED);
+    }
+
+    @Test
+    void processingRecent_neverAbandoned_staysInProgress() {
+        service.begin("key-fresh-processing", "fp-fresh");
+
+        assertReason(() -> service.begin("key-fresh-processing", "fp-fresh"), IdempotencyException.Reason.IN_PROGRESS);
+    }
+
+    // --- TASK-010: opportunistic expiration (inside begin(), not waiting for the scheduler) ---
+
+    @Test
+    void completedExpired_isTreatedAsNewOperation() {
+        var start = (IdempotencyDecision.Start) service.begin("key-completed-expired", "fp-expired");
+        service.complete(start.operationId(), "resposta antiga", null);
+        backdateUpdatedAt(start.operationId(), OffsetDateTime.now().minusHours(25));
+
+        var decision = service.begin("key-completed-expired", "fp-expired");
+
+        assertThat(decision).isInstanceOf(IdempotencyDecision.Start.class);
+        var entity = repository.findByIdempotencyKey("key-completed-expired").orElseThrow();
+        assertThat(entity.getStatus()).isEqualTo(AudioCommandStatus.PROCESSING);
+    }
+
+    @Test
+    void failedExpiredAtTranscription_isTreatedAsNewOperation() {
+        var start = (IdempotencyDecision.Start) service.begin("key-failed-expired-transcription", "fp-expired");
+        service.fail(start.operationId(), AiIntegrationException.Stage.TRANSCRIPTION);
+        backdateUpdatedAt(start.operationId(), OffsetDateTime.now().minusHours(25));
+
+        var decision = service.begin("key-failed-expired-transcription", "fp-expired");
+
+        assertThat(decision).isInstanceOf(IdempotencyDecision.Start.class);
+    }
+
+    @Test
+    void failedExpiredAtChat_isAlsoTreatedAsNewOperation_becauseWindowElapsed() {
+        var start = (IdempotencyDecision.Start) service.begin("key-failed-expired-chat", "fp-expired");
+        service.fail(start.operationId(), AiIntegrationException.Stage.CHAT);
+        backdateUpdatedAt(start.operationId(), OffsetDateTime.now().minusHours(25));
+
+        var decision = service.begin("key-failed-expired-chat", "fp-expired");
+
+        assertThat(decision).isInstanceOf(IdempotencyDecision.Start.class);
+    }
+
+    // --- TASK-010: optimistic lock conflict between two loaded copies of the same row ---
+    // A real multi-threaded reproduction proved unreliable in this sandboxed H2/JVM
+    // environment (see the unique-constraint test above for the same caveat), so this
+    // test proves the conflict directly: two independent (detached) copies of the same
+    // row, the second save must fail once the first has already advanced the version.
+
+    @Test
+    void concurrentUpdate_optimisticLock_detectsConflict() {
+        var start = (IdempotencyDecision.Start) service.begin("key-optimistic", "fp-optimistic");
+        entityManager.flush();
+        entityManager.clear();
+
+        var copyA = repository.findById(start.operationId()).orElseThrow();
+        entityManager.detach(copyA);
+
+        var copyB = repository.findById(start.operationId()).orElseThrow();
+        copyB.fail(AiIntegrationException.Stage.CHAT, OffsetDateTime.now());
+        repository.saveAndFlush(copyB);
+        entityManager.clear();
+
+        copyA.fail(AiIntegrationException.Stage.SPEECH, OffsetDateTime.now());
+        assertThatThrownBy(() -> repository.saveAndFlush(copyA))
+                .isInstanceOf(OptimisticLockingFailureException.class);
+    }
+
+    private void backdateUpdatedAt(UUID operationId, OffsetDateTime updatedAt) {
+        var entity = repository.findById(operationId).orElseThrow();
+        entity.setUpdatedAt(updatedAt);
+        repository.save(entity);
     }
 }

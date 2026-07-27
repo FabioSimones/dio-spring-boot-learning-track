@@ -175,7 +175,14 @@ public class TransactionController {
                     caracteres, apenas letras/números/"._:-"). Reenviar a mesma chave com o mesmo arquivo nunca \
                     repete transcrição/ChatClient/Tool Calling: a resposta é reconstruída (novo TTS) a partir do \
                     texto já gerado. A mesma chave com um arquivo diferente, ou uma segunda requisição enquanto a \
-                    primeira ainda processa, retorna 409."""
+                    primeira ainda processa, retorna 409.
+
+                    A garantia de idempotência vale apenas dentro de uma janela de retenção configurável (padrão: \
+                    24h para operações concluídas ou falhadas; 15 min de inatividade para considerar uma operação \
+                    em processamento como abandonada). Após a janela, o registro é removido automaticamente e a \
+                    mesma chave pode voltar a ser aceita como se fosse uma operação nova - reenviar o mesmo comando \
+                    depois de expirado pode gerar uma nova transação. Use uma chave nova por intenção de comando; \
+                    nunca reutilize propositalmente uma chave antiga."""
     )
     @ApiResponses({
             @ApiResponse(
@@ -375,7 +382,8 @@ public class TransactionController {
         } else {
             var start = (IdempotencyDecision.Start) decision;
             try {
-                var result = aiTransactionProcessor.process(new ByteArrayResource(audioBytes));
+                var result = aiTransactionProcessor.process(new ByteArrayResource(audioBytes),
+                        stage -> idempotencyService.markStage(start.operationId(), stage));
                 idempotencyService.complete(start.operationId(), result.responseText(), result.transactionId());
                 responseAudio = result.audio();
             }

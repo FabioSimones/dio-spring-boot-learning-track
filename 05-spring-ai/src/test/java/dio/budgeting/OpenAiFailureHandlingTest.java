@@ -110,7 +110,7 @@ class OpenAiFailureHandlingTest {
     void aiIntegrationFailure_mapsToStandardizedProblemDetail(AiIntegrationException.Reason reason,
                                                                 int expectedStatus, String expectedTitle) throws Exception {
         doNothing().when(audioFileValidator).validate(any());
-        when(aiTransactionProcessor.process(any()))
+        when(aiTransactionProcessor.process(any(), any()))
                 .thenThrow(new AiIntegrationException(AiIntegrationException.Stage.CHAT, reason, "detail for " + reason));
 
         mockMvc.perform(multipart("/transactions/ai").file(audioFile()))
@@ -125,7 +125,7 @@ class OpenAiFailureHandlingTest {
     @Test
     void aiIntegrationFailure_neverLeaksExceptionMessageOrStackTrace() throws Exception {
         doNothing().when(audioFileValidator).validate(any());
-        when(aiTransactionProcessor.process(any())).thenThrow(new AiIntegrationException(
+        when(aiTransactionProcessor.process(any(), any())).thenThrow(new AiIntegrationException(
                 AiIntegrationException.Stage.TRANSCRIPTION, AiIntegrationException.Reason.CONFIGURATION_ERROR,
                 "O serviço de inteligência artificial não está disponível no momento.",
                 new RuntimeException("Invalid API key provided: sk-test-sensitive")));
@@ -156,14 +156,14 @@ class OpenAiFailureHandlingTest {
     @Test
     void success_returnsAudioMp3() throws Exception {
         doNothing().when(audioFileValidator).validate(any());
-        when(aiTransactionProcessor.process(any()))
+        when(aiTransactionProcessor.process(any(), any()))
                 .thenReturn(new AiTransactionResult(new byte[]{1, 2, 3}, "Transação registrada.", null));
 
         mockMvc.perform(multipart("/transactions/ai").file(audioFile()))
                 .andExpect(status().isOk());
 
         verify(audioFileValidator).validate(any());
-        verify(aiTransactionProcessor).process(any());
+        verify(aiTransactionProcessor).process(any(), any());
         verify(idempotencyService).complete(any(), org.mockito.ArgumentMatchers.eq("Transação registrada."), any());
     }
 }

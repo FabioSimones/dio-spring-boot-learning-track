@@ -17,6 +17,7 @@ import org.springframework.web.client.ResourceAccessException;
 
 import java.io.IOException;
 import java.nio.charset.Charset;
+import java.util.function.Consumer;
 
 /**
  * Integration boundary between the controller and the three OpenAI-backed
@@ -60,8 +61,22 @@ public class AiTransactionProcessor {
     }
 
     public AiTransactionResult process(Resource audioResource) {
+        return process(audioResource, stage -> { });
+    }
+
+    /**
+     * Same pipeline as {@link #process(Resource)}, but reports the stage about
+     * to run to {@code stageTracker} right before each external call - used by
+     * the controller to persist {@code AudioCommandOperationEntity.currentStage}
+     * (TASK-010), so an abandoned operation can later be classified as safe
+     * (before Tool Calling) or unsafe (Tool Calling may have run) to retry.
+     */
+    public AiTransactionResult process(Resource audioResource, Consumer<AiIntegrationException.Stage> stageTracker) {
+        stageTracker.accept(AiIntegrationException.Stage.TRANSCRIPTION);
         String transcript = transcribe(audioResource);
+        stageTracker.accept(AiIntegrationException.Stage.CHAT);
         String reply = chat(transcript);
+        stageTracker.accept(AiIntegrationException.Stage.SPEECH);
         byte[] audio = synthesize(reply);
         // transactionId is always null - see AiTransactionResult's javadoc.
         return new AiTransactionResult(audio, reply, null);
