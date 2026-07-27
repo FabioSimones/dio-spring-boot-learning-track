@@ -35,3 +35,20 @@ out/
 
 ### VS Code ###
 .vscode/
+
+### Secrets / local environment (TASK-012) ###
+# Real credentials and local-only overrides must never be versioned. Files
+# ending in .example (e.g. application-prod.properties.example, .env.example)
+# are documentation - placeholders only - and are intentionally NOT matched
+# by any pattern below. application-dev.properties and application-test.properties
+# are also intentionally NOT ignored: both contain only ${VAR} placeholders/
+# safe test defaults, never a real secret, and must stay versioned.
+.env
+.env.*
+!.env.example
+application-local.properties
+application-secret.properties
+application-prod.properties
+secrets/
+*.key
+*.pem

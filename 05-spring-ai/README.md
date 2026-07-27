@@ -66,18 +66,117 @@ Common architecture concepts are documented in the root README:
 
 ## How to Run
 
-Set your OpenAI API key:
+Run the tests (no profile, no OpenAI call, no MySQL/Docker needed):
 
 ```bash
-export OPENAI_API_KEY="your_api_key_here"
-```
-
-Run the application and tests:
-
-```bash
-./gradlew bootRun
 ./gradlew test
 ```
+
+Run the application against a real MySQL/OpenAI (see [Configuração por ambiente](#configuração-por-ambiente) below for the full picture):
+
+```bash
+export SPRING_PROFILES_ACTIVE=dev
+export DB_URL=jdbc:mysql://localhost:3306/budgeting
+export DB_USERNAME=root
+export DB_PASSWORD="your-local-password"
+export OPENAI_API_KEY="your_api_key_here"
+./gradlew bootRun
+```
+
+Windows note: this repository's path contains `&`, which breaks `gradlew.bat`'s internal argument handling. If `.\gradlew.bat ...` fails with a garbled "not recognized as a command" error, invoke the wrapper jar directly instead:
+
+```powershell
+java -jar gradle\wrapper\gradle-wrapper.jar test
+java -jar gradle\wrapper\gradle-wrapper.jar bootRun
+```
+
+## Configuração por ambiente
+
+Configuration is split by environment (TASK-012) so no secret is ever versioned and each environment fails predictably instead of silently misbehaving.
+
+### Estrutura de arquivos
+
+| Arquivo | Carregado quando | Contém segredo? |
+| --- | --- | --- |
+| `src/main/resources/application.properties` | Sempre (base comum) | Não — sem chave OpenAI, sem datasource, sem perfil ativo |
+| `src/main/resources/application-dev.properties` | `SPRING_PROFILES_ACTIVE=dev` | Não — só `${VAR}` e defaults locais não sensíveis (`localhost`, `root`) |
+| `src/main/resources/application-prod.properties.example` | **Nunca automaticamente** (extensão `.example`) | Não — apenas documentação/placeholders |
+| `src/test/resources/application-test.properties` | Perfil `test` (usado pela suíte de testes) | Não — H2 em memória, chave `test-key-not-a-real-credential` explicitamente fictícia |
+| `.env.example` | **Nunca automaticamente** (não há suporte a dotenv no projeto) | Não — apenas documentação |
+
+**Importante**: rodar sem nenhum perfil ativo carrega só o arquivo comum — isso é proposital, não um esquecimento. Sem `spring.ai.openai.api-key`, a própria autoconfiguração do Spring AI recusa a criação dos beans de IA (`OpenAI API key must be set...`), então a aplicação completa não sobe sem `dev`, `test` ou um perfil de produção equivalente ativo.
+
+### Matriz de configuração
+
+| Categoria | Common | Dev | Test | Prod (`.example`) |
+| --- | --- | --- | --- | --- |
+| Datasource | — | MySQL (`DB_URL`/`DB_USERNAME` com default `localhost`; `DB_PASSWORD` obrigatório) | H2 em memória | MySQL (tudo obrigatório, sem default) |
+| `ddl-auto` | — | `update` | `create-drop` | `validate` |
+| OpenAI key | — (ausente) | obrigatória (`${OPENAI_API_KEY}`, sem default) | fictícia (`test-key-not-a-real-credential`) | obrigatória (`${OPENAI_API_KEY}`, sem default) |
+| Swagger | habilitado (padrão do springdoc) | habilitado | habilitado | **desabilitado** (`springdoc.*.enabled=false`) |
+| Actuator health | ligado | ligado | ligado | ligado |
+| Actuator metrics | ligado (baseline) | ligado | ligado | **desligado** |
+| Scheduler de limpeza | ligado (padrão) | ligado | **desligado** (`app.idempotency.cleanup-enabled=false`) | ligado |
+| Log level (root) | `INFO` | `INFO` (+ `DEBUG` só em `org.springframework.ai`/`dio.budgeting`) | `INFO` | `INFO` |
+
+### Variáveis de ambiente
+
+| Variável | Obrigatória | Perfil | Descrição |
+| --- | ---: | --- | --- |
+| `SPRING_PROFILES_ACTIVE` | Não | Todos | Seleciona `dev`/`prod`; deixe vazio para só a configuração comum, ou use `docker compose up` sem definir nada |
+| `DB_URL` | Sim* | `dev`, `prod` | URL JDBC do MySQL (*em `dev` tem default `jdbc:mysql://localhost:3306/budgeting`) |
+| `DB_USERNAME` | Sim* | `dev`, `prod` | Usuário do MySQL (*em `dev` tem default `root`) |
+| `DB_PASSWORD` | Sim | `dev`, `prod` | Senha do MySQL — sem default em nenhum perfil |
+| `OPENAI_API_KEY` | Sim | `dev`, `prod` | Chave da API OpenAI — sem default em nenhum perfil |
+| `AUDIO_MAX_SIZE` | Não | Todos | Override do limite de upload (padrão `10MB`) |
+| `AI_CONNECT_TIMEOUT` / `AI_READ_TIMEOUT` | Não | Todos | Overrides de timeout HTTP para OpenAI (padrão `10s`/`60s`) |
+| `AI_RETRY_MAX_ATTEMPTS` | Não | Todos | Tentativas do `spring-ai-retry` (padrão `2`) |
+| `IDEMPOTENCY_COMPLETED_RETENTION` / `IDEMPOTENCY_FAILED_RETENTION` / `IDEMPOTENCY_PROCESSING_TIMEOUT` / `IDEMPOTENCY_CLEANUP_ENABLED` | Não | Todos | Overrides da política de idempotência (ver [seção de expiração e limpeza](#expiração-e-limpeza-task-010)) |
+
+### Execução local
+
+**Via Docker Compose** (mais simples, sem precisar de `SPRING_PROFILES_ACTIVE`): o `spring-boot-docker-compose` (dependência `developmentOnly`, ausente do artefato de produção) detecta `compose.yml` e conecta automaticamente ao MySQL do container. Basta configurar `OPENAI_API_KEY` e rodar `./gradlew bootRun` — nenhuma outra variável é necessária. (`compose.yml` usa credenciais triviais de desenvolvimento local, já versionadas antes desta tarefa; Docker Compose está fora do escopo desta tarefa.)
+
+**Via perfil `dev`** (MySQL próprio, gerenciado por você):
+
+```powershell
+$env:SPRING_PROFILES_ACTIVE="dev"
+$env:DB_URL="jdbc:mysql://localhost:3306/budgeting"
+$env:DB_USERNAME="root"
+$env:DB_PASSWORD="sua-senha"
+$env:OPENAI_API_KEY="sua-chave"
+
+.\gradlew.bat bootRun
+```
+
+```bash
+export SPRING_PROFILES_ACTIVE=dev
+export DB_URL=jdbc:mysql://localhost:3306/budgeting
+export DB_USERNAME=root
+export DB_PASSWORD='sua-senha'
+export OPENAI_API_KEY='sua-chave'
+
+./gradlew bootRun
+```
+
+Nenhum dos valores acima é real — substitua pelos seus.
+
+### Perfil de testes
+
+`./gradlew test` já ativa o perfil `test` (H2 em memória, chave fictícia, scheduler desligado) para toda a suíte — nenhuma variável de ambiente é necessária para rodar os testes. Nenhum teste conecta a MySQL, nenhum chama a OpenAI de verdade, nenhum usa Docker.
+
+### Perfil de produção
+
+Não existe um `application-prod.properties` versionado — apenas `application-prod.properties.example`, que documenta as propriedades esperadas mas **nunca é carregado automaticamente** (a extensão `.example` garante isso). Para rodar em produção: provisione `DB_URL`/`DB_USERNAME`/`DB_PASSWORD`/`OPENAI_API_KEY` como variáveis de ambiente reais (secret manager, variável de CI/CD etc. — fora do escopo aqui) e replique as propriedades desse arquivo onde sua aplicação realmente lê `application-prod.properties`. `EnvironmentConfigurationValidator` falha o startup com mensagem clara (`"A variável OPENAI_API_KEY é obrigatória..."`) se qualquer uma das quatro estiver ausente.
+
+### Segurança de segredos
+
+- **Nunca versione a chave da OpenAI** — se uma chave real já foi commitada em algum momento, revogue-a imediatamente na OpenAI e gere uma nova; reescrever o histórico do Git está fora do escopo desta tarefa.
+- `.env.example` é só documentação — não é carregado automaticamente pela aplicação.
+- H2 só existe no perfil de teste; MySQL nunca é usado nos testes.
+- `ddl-auto` não substitui migração versionada (o projeto ainda não usa Flyway/Liquibase) — `update` (dev) pode aplicar mudanças destrutivas silenciosamente; `validate` (prod) só detecta divergência, não corrige.
+- Swagger e métricas do Actuator ficam restritos em produção (ver matriz acima) — sem autenticação na frente do Actuator (fora do escopo desta tarefa), publicar métricas ou a documentação da API publicamente é uma exposição desnecessária.
+- Nenhuma API key real deve aparecer em testes — `VersionedSecretsTest` verifica estaticamente os arquivos de configuração/documentação versionados em busca do formato de uma chave OpenAI real (`sk-` + 20+ caracteres).
 
 ## Documentação da API
 
@@ -378,6 +477,7 @@ O projeto combina três níveis de teste, cada um cobrindo uma responsabilidade 
 - **Testes de idempotência** (`AudioPayloadFingerprintTest`, `AudioCommandIdempotencyServiceTest`, `TransactionAudioIdempotencyTest`) — cobrem validação da chave, fingerprint SHA-256, replay/conflito/em-processamento/política de retry e a constraint única no H2 (ver [seção de idempotência](#idempotência-do-processamento-por-áudio)). Sem chamada real à OpenAI.
 - **Testes de expiração e limpeza** (`IdempotencyPropertiesTest`, `IdempotencyExpirationPolicyTest`, `IdempotencyCleanupServiceTest`, `IdempotencyCleanupSchedulerTest`, mais os cenários de recuperação/expiração/lock otimista adicionados a `AudioCommandIdempotencyServiceTest`) — cobrem validação de propriedades, limites de janela com `Clock.fixed`, recuperação de `PROCESSING` abandonada por estágio, remoção em lote com H2 real e conflito de `@Version` (ver [seção de expiração e limpeza](#expiração-e-limpeza-task-010)). Scheduler nunca roda automaticamente nos testes; sem chamada real à OpenAI.
 - **Testes de observabilidade** (`CorrelationIdFilterTest`, `AiObservabilityTest`, `AiMetricsIntegrationTest`, `ActuatorEndpointsTest`, mais métricas adicionadas a `AiTransactionProcessorTest`, `AudioFileValidatorTest` e `IdempotencyCleanupSchedulerTest`) — cobrem o filtro de correlação (header, MDC, limpeza, caminho de erro), o contrato de tags/nomes de métrica com `SimpleMeterRegistry`, o fluxo `POST /transactions/ai` de ponta a ponta com `MeterRegistry` real do contexto, e a exposição controlada do Actuator (ver [seção de observabilidade](#observabilidade)). Sem chamada real à OpenAI.
+- **Testes de configuração por ambiente** (`EnvironmentConfigurationTest`, `ProductionProfileSecurityTest`, `VersionedSecretsTest`) — cobrem `EnvironmentConfigurationValidator` (`ApplicationContextRunner`, sem conexão real) para `dev`/`prod`/padrão/`test`, a postura restrita de produção (Actuator só `health`, Swagger desabilitado, `ddl-auto=validate`) sem carregar um perfil `prod` real, e uma verificação estática dos arquivos de configuração/documentação versionados em busca de segredos reais (ver [seção de configuração por ambiente](#configuração-por-ambiente)). Sem MySQL, sem Docker, sem chamada real à OpenAI.
 
 **Banco de teste**: os testes de integração usam H2 em memória (`com.h2database:h2`, dependência apenas em `testRuntimeOnly`), configurado no perfil `test` (`src/test/resources/application-test.properties`, modo de compatibilidade MySQL, schema recriado via `ddl-auto=create-drop`). Não depende de MySQL local nem de Docker. Cada teste roda dentro de uma transação com rollback automático (`@Transactional`), garantindo isolamento sem necessidade de limpeza manual.
 

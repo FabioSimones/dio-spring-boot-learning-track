@@ -1,0 +1,40 @@
+# Reference for a production profile (TASK-012) - the ".example" suffix means
+# Spring Boot NEVER loads this file automatically (it only looks for
+# "application-prod.properties"). This is deliberate: a real prod profile file
+# is not versioned, so it can never be accidentally half-configured in git.
+#
+# To actually run with this profile, provision DB_URL/DB_USERNAME/DB_PASSWORD/
+# OPENAI_API_KEY as real environment variables (a secret manager, CI/CD
+# variables, etc. - out of scope here) and copy this file's *properties*
+# (not literally this file) to wherever your deployment reads
+# application-prod.properties from. Every value below is a placeholder with
+# NO default - EnvironmentConfigurationValidator fails startup with a clear
+# message if any of the four is missing, and plain Spring property resolution
+# already fails for the other three (as verified: an unresolved ${VAR} with no
+# default throws PlaceholderResolutionException wherever it's actually read).
+spring.datasource.url=${DB_URL}
+spring.datasource.username=${DB_USERNAME}
+spring.datasource.password=${DB_PASSWORD}
+
+# validate (not update): a production deployment should never let Hibernate
+# alter the schema - it only checks the existing schema matches the entities
+# and fails fast otherwise. This project has no Flyway/Liquibase yet, so there
+# is still no versioned migration path; "validate" only catches drift, it
+# does not apply it.
+spring.jpa.hibernate.ddl-auto=validate
+spring.jpa.show-sql=false
+
+spring.ai.openai.api-key=${OPENAI_API_KEY}
+
+logging.level.root=INFO
+logging.level.org.springframework.ai=INFO
+
+# Narrower than the common baseline (health,metrics): with no authentication
+# in front of the Actuator (out of scope here), publishing metrics alongside
+# health in production is an unnecessary exposure - only health stays on.
+management.endpoints.web.exposure.include=health
+
+# No authentication in front of Swagger either - disable it outright rather
+# than publish the API shape/examples publicly.
+springdoc.api-docs.enabled=false
+springdoc.swagger-ui.enabled=false
